@@ -41,7 +41,7 @@ import {
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import { IconButton } from '../base/IconButton.js'
 import { Tooltip } from '../base/Tooltip.js'
-import { ensureApiKey } from '../settings/settingsDialogState.js'
+import { ensureApiKey, useSettingsDialog } from '../settings/settingsDialogState.js'
 import { DragMask, useFileDrop } from './DragMask.js'
 import { showToast } from '../base/toastState.js'
 import { ACCEPT, ACCEPT_TEXT_ONLY, useUploads } from '../../services/attachments.js'
@@ -74,10 +74,10 @@ const ModelPicker = () => {
     providers.find((item) => item.id === activeProviderId) ?? providers[0] ?? DEFAULT_PROVIDER
   const model = provider.models.find((item) => item.id === activeModelId) ?? provider.models[0]
   /** 当前模型支持的强度档位；空数组表示不支持深度思考，菜单里不出现这一行 */
-  const efforts = modelEfforts(provider, model)
+  const efforts = modelEfforts(model)
   const showEffort = efforts.length > 0
   /** 真实生效的档位：保存的强度不在当前模型支持范围内时回落到最强档 */
-  const effectiveEffort = resolveEffort(provider, model, effort)
+  const effectiveEffort = resolveEffort(model, effort)
   const [open, setOpen] = useState(false)
   const [pane, setPane] = useState<'root' | 'model' | 'effort'>('root')
   const { anchorRef, floatingRef, position } = useAnchoredPosition<HTMLSpanElement, HTMLDivElement>(
@@ -222,6 +222,8 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
   const search = useSettings((state) => state.search)
+  /** 设置弹窗打开时不抢焦点，把光标留给弹窗里的输入框 */
+  const settingsOpen = useSettingsDialog((state) => state.open)
   /** 当前模型是否接受图片；切换模型后文件选择器的过滤条件跟着变 */
   const acceptsImage = useSettings((state) => {
     const provider =
@@ -240,7 +242,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       return true
     }
     const model = provider.models.find((item) => item.id === state.activeModelId) ?? provider.models[0]
-    return modelSupportsReasoning(provider, model)
+    return modelSupportsReasoning(model)
   })
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -357,8 +359,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           className={clsx(styles.textarea, recording && isMobile && styles.textareaHidden)}
           placeholder={t('chatInputPlaceholderChat')}
           rows={2}
-          // 移动端不自动聚焦，避免一打开就弹出键盘
-          autoFocus={!isMobile}
+          // 移动端不自动聚焦，避免一打开就弹出键盘；
+          // 设置弹窗打开时也不抢焦点：首次进入是先去填 API Key，
+          // 输入框会在会话就绪后重挂载，这里抢一次光标就把弹窗里的焦点顶掉了。
+          autoFocus={!isMobile && !settingsOpen}
           disabled={importingHistory}
           value={text}
           onChange={(event) => setText(event.target.value)}

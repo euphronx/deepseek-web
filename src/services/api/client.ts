@@ -78,9 +78,20 @@ const authHeaders = (apiKey: string): Record<string, string> => ({
   Authorization: `Bearer ${apiKey}`,
 })
 
-/** 用 GET /models 校验 API Key（不产生费用） */
-export const verifyApiKey = async (apiKey: string, signal?: AbortSignal): Promise<void> => {
-  await request(`${getApiBaseUrl()}/models`, {
+/**
+ * 用 GET /models 校验 API Key（不产生费用）。
+ *
+ * `baseUrl` 用于校验尚未保存的地址：设置页里改完地址还没保存就要验 Key，
+ * 否则会拿旧地址去验，改完地址的用户会看到莫名其妙的失败。
+ * 传空串按未声明处理，回落到当前生效的地址。
+ */
+export const verifyApiKey = async (
+  apiKey: string,
+  signal?: AbortSignal,
+  baseUrl?: string
+): Promise<void> => {
+  const origin = baseUrl?.trim() || getApiBaseUrl()
+  await request(`${origin}/models`, {
     method: 'GET',
     headers: authHeaders(apiKey),
     signal,

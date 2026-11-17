@@ -49,6 +49,7 @@ declare const styles: {
   readonly "modalityChoice": string;
   readonly "modalityBox": string;
   readonly "formHint": string;
+  readonly "verifyError": string;
   readonly "capacityRow": string;
   readonly "modelAction": string;
   readonly "modelActionDanger": string;

@@ -1008,9 +1008,9 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   const modelProfile = getActiveModelProfile()
   const deepseek = isDeepSeekProvider(provider)
   // 收敛到该模型真正支持的档位；不支持深度思考时是 undefined，不携带该参数
-  const effort = resolveEffort(provider, modelProfile, useSettings.getState().effort)
-  const maxTokens = modelProfile.maxTokens ?? provider.defaultMaxTokens
-  const contextWindow = modelProfile.contextWindow ?? provider.defaultContextWindow
+  const effort = resolveEffort(modelProfile, useSettings.getState().effort)
+  const maxTokens = modelProfile.maxTokens
+  const contextWindow = modelProfile.contextWindow
   if (!getSession(sessionId)?.title) {
     titleRequests.add(controller)
   }

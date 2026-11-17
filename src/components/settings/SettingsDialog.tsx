@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   IconDarkOutline16,
   IconDataOutline16,
@@ -11,18 +11,20 @@ import {
   IconUploadOutline14,
 } from '../base/icons.js'
 import { createId } from '../../utils/id.js'
+import { verifyApiKey } from '../../services/api/client.js'
+import { classifyApiError } from '../../services/api/errors.js'
 import {
   BackupError,
   clearHistory,
   exportHistory,
   importHistory,
 } from '../../services/chat/backup.js'
-import { useIsMobile } from '../../app/viewport.js'
 import { useChatStore } from '../../services/chat/store.js'
+import { useIsMobile } from '../../app/viewport.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
   ALL_EFFORTS,
-  DEFAULT_PROVIDER,
+  isBuiltinProvider,
   isChineseBrowser,
   modelAccepts,
   removeProvider,
@@ -42,7 +44,6 @@ import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { Select } from '../base/Select.js'
 import { showToast } from '../base/toastState.js'
-import { ApiKeyConfirm, ApiKeyField, useApiKeyEditor } from './ApiKeyField.js'
 import { closeSettings, useSettingsDialog, type SettingsSection } from './settingsDialogState.js'
 import styles from './Settings.module.css'
 
@@ -68,11 +69,9 @@ const sections: { value: SettingsSection; label: TranslationKey; icon: ReactNode
 
 const SettingsContent = () => {
   const t = useTranslate()
-  const isMobile = useIsMobile()
   // 打开时按调用方指定的分组选中，之后在弹窗内切换
   const [section, setSection] = useState(() => useSettingsDialog.getState().section)
-  // 切换分组不丢失正在输入的 API Key 与导入状态
-  const apiKeyEditor = useApiKeyEditor()
+  // 切换分组不丢失导入状态
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
   const replacingHistory = useChatStore((state) => state.importingHistory)
@@ -117,7 +116,6 @@ const SettingsContent = () => {
             <ModelSettings />
           ) : (
             <>
-              <ApiKeyField editor={apiKeyEditor} />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <SettingCell
@@ -135,7 +133,6 @@ const SettingsContent = () => {
                   </Button>
                 }
               />
-              {isMobile ? <ApiKeyConfirm editor={apiKeyEditor} /> : null}
             </>
           )}
         </div>
@@ -425,7 +422,12 @@ const ModelSettings = () => {
   const providers = useSettings((state) => state.providers)
   const activeProviderId = useSettings((state) => state.activeProviderId)
   const activeModelId = useSettings((state) => state.activeModelId)
-  const [editing, setEditing] = useState<ModelProvider | null>(null)
+  // 当前供应商还没有 Key 时直接展开它的表单：首次使用的唯一任务是填 Key，
+  // 停在一张没有输入框的列表上等于让人自己找路。
+  const [editing, setEditing] = useState<ModelProvider | null>(() => {
+    const active = providers.find((item) => item.id === activeProviderId) ?? providers[0]
+    return active && !active.apiKey ? active : null
+  })
 
   if (editing) {
     return <ProviderForm provider={editing} onDone={() => setEditing(null)} />
@@ -451,7 +453,7 @@ const ModelSettings = () => {
                 onClick={() => setActiveModel(provider.id, model.id)}
               >
                 <span className={styles.modelName}>{provider.name}</span>
-                {provider.id !== DEFAULT_PROVIDER.id ? (
+                {!isBuiltinProvider(provider) ? (
                   <span className={styles.modelTag}>{t('modelCustom')}</span>
                 ) : null}
                 <span
@@ -479,7 +481,8 @@ const ModelSettings = () => {
                 >
                   {t('modelEdit')}
                 </button>
-                {providers.length > 1 ? (
+                {/* 内置 DeepSeek 不提供删除：它的配置由代码维护，删掉就没法回落 */}
+                {!isBuiltinProvider(provider) && providers.length > 1 ? (
                   <button
                     type="button"
                     className={clsx(styles.modelAction, styles.modelActionDanger)}
@@ -540,12 +543,78 @@ const ProviderForm = ({
   const t = useTranslate()
   const [draft, setDraft] = useState(provider)
   const [editingModel, setEditingModel] = useState<number | null>(null)
-  const update = (patch: Partial<ModelProvider>) => setDraft((value) => ({ ...value, ...patch }))
+  /** 保存过程中包含一次 Key 校验，按钮上显示进度 */
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const update = (patch: Partial<ModelProvider>) => {
+    setDraft((value) => ({ ...value, ...patch }))
+    setSaveError(null)
+  }
+  const apiKey = draft.apiKey.trim()
+  const baseUrl = draft.baseUrl.trim()
+
+  const isMobile = useIsMobile()
+  const keyInputRef = useRef<HTMLInputElement>(null)
+  // 还没有 Key 时把光标放进 Key 输入框：首次进来唯一要做的事就是填它。
+  // 移动端不自动聚焦，否则一打开就弹键盘盖住半个屏幕。
+  const missingKey = provider.apiKey === ''
+  useEffect(() => {
+    if (missingKey && !isMobile) {
+      keyInputRef.current?.focus()
+    }
+  }, [missingKey, isMobile])
+
+  /**
+   * 保存：先校验 Key，通过才落盘。
+   * 与原实现一致——填了 Key 就在保存时验一次，不额外加一个「验证」步骤；
+   * 校验用的是表单里正在编辑的地址，不是已保存的那个。
+   */
+  const submit = async () => {
+    if (saving) {
+      return
+    }
+    const models = draft.models
+      .map((model) => ({ ...model, id: model.id.trim(), name: model.name.trim() }))
+      .filter((model) => model.id !== '')
+      .map((model) => ({ ...model, name: model.name || model.id }))
+    // 一个模型都没有就不保存：空 provider 没法用
+    if (models.length === 0) {
+      return
+    }
+    setSaveError(null)
+    if (apiKey) {
+      setSaving(true)
+      try {
+        await verifyApiKey(apiKey, undefined, baseUrl)
+      } catch (error) {
+        setSaving(false)
+        setSaveError(
+          classifyApiError(error) === 'unauthorized'
+            ? t('apiKeyInvalid')
+            : t('apiKeyVerificationFailed', {
+                message: error instanceof Error ? error.message : String(error),
+              })
+        )
+        return
+      }
+    }
+    saveProvider({
+      ...draft,
+      name: draft.name.trim() || t('providerDefaultName'),
+      baseUrl,
+      apiKey,
+      models,
+    })
+    setSaving(false)
+    onDone()
+  }
 
   if (editingModel !== null) {
     return (
       <ModelForm
         model={draft.models[editingModel]}
+        // 模型没声明的能力用 provider 默认值预填，表单打开就能看到真实生效的配置
+        provider={draft}
         onCancel={() => setEditingModel(null)}
         onSave={(model) => {
           setDraft((value) => ({
@@ -592,6 +661,7 @@ const ProviderForm = ({
         <label className={styles.formField}>
           <span className={styles.formLabel}>{t('modelApiKeyLabel')}</span>
           <input
+            ref={keyInputRef}
             className={styles.formInput}
             type="password"
             autoComplete="off"
@@ -599,40 +669,16 @@ const ProviderForm = ({
             placeholder={t('apiKeyPlaceholder')}
             value={draft.apiKey}
             onChange={(event) => update({ apiKey: event.target.value })}
+            onKeyDown={(event) => {
+              // 和原实现一致：回车直接提交，提交时才校验
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                void submit()
+              }
+            }}
           />
         </label>
-        {/* provider 级默认：模型没声明时继承这里 */}
-        <div className={styles.capacityRow}>
-          <label className={styles.formField}>
-            <span className={styles.formLabel}>{t('modelContextWindow')}</span>
-            <input
-              className={styles.formInput}
-              type="text"
-              inputMode="numeric"
-              autoComplete="off"
-              placeholder={t('modelCapacityPlaceholder')}
-              value={draft.defaultContextWindow === undefined ? '' : String(draft.defaultContextWindow)}
-              onChange={(event) =>
-                update({ defaultContextWindow: parseCapacity(event.target.value) })
-              }
-            />
-          </label>
-          <label className={styles.formField}>
-            <span className={styles.formLabel}>{t('modelMaxTokens')}</span>
-            <input
-              className={styles.formInput}
-              type="text"
-              inputMode="numeric"
-              autoComplete="off"
-              placeholder={t('modelCapacityPlaceholder')}
-              value={draft.defaultMaxTokens === undefined ? '' : String(draft.defaultMaxTokens)}
-              onChange={(event) => update({ defaultMaxTokens: parseCapacity(event.target.value) })}
-            />
-          </label>
-        </div>
-        <span className={styles.formHint}>{t('providerDefaultHint')}</span>
-
-        {/* 模型列表：每个模型可单独覆盖能力 */}
+        {saveError ? <span className={styles.verifyError}>{saveError}</span> : null}
+        {/* 模型列表：容量与能力都在模型里配，provider 只给模态默认值 */}
         <div className={styles.formField}>
           <span className={styles.formLabel}>{t('providerModelsLabel')}</span>
           <div className={styles.modelList}>
@@ -693,53 +739,36 @@ const ProviderForm = ({
         <Button variant="outlined" size="m" onClick={onDone}>
           {t('modelCancel')}
         </Button>
-        <Button
-          size="m"
-          onClick={() => {
-            const models = draft.models
-              .map((model) => ({ ...model, id: model.id.trim(), name: model.name.trim() }))
-              .filter((model) => model.id !== '')
-              .map((model) => ({
-                ...model,
-                name: model.name || model.id,
-                contextWindow: model.contextWindow,
-                maxTokens: model.maxTokens,
-                inputModalities: model.inputModalities,
-                reasoningEfforts: model.reasoningEfforts,
-              }))
-            // 一个模型都没有就不保存：空 provider 没法用
-            if (models.length === 0) {
-              return
-            }
-            saveProvider({
-              ...draft,
-              name: draft.name.trim() || t('providerDefaultName'),
-              baseUrl: draft.baseUrl.trim(),
-              apiKey: draft.apiKey.trim(),
-              models,
-            })
-            onDone()
-          }}
-        >
-          {t('modelSave')}
+        <Button size="m" disabled={saving} onClick={() => void submit()}>
+          {saving ? t('apiKeyVerifying') : t('modelSave')}
         </Button>
       </div>
     </div>
   )
 }
 
-/** 单个模型编辑：标识、显示名，以及覆盖 provider 默认的能力 */
+/**
+ * 单个模型编辑：容量、输入模态与推理强度都在这里配。
+ *
+ * 只有输入模态会从 provider 的默认值预填——那是 provider 唯一持有的能力默认；
+ * 容量属于模型自身，没有可继承的来源。
+ */
 const ModelForm = ({
   model,
+  provider,
   onCancel,
   onSave,
 }: {
   model: ModelProfile
+  provider: ModelProvider
   onCancel: () => void
   onSave: (model: ModelProfile) => void
 }) => {
   const t = useTranslate()
-  const [draft, setDraft] = useState(model)
+  const [draft, setDraft] = useState<ModelProfile>(() => ({
+    ...model,
+    inputModalities: model.inputModalities ?? provider.defaultInputModalities,
+  }))
   const update = (patch: Partial<ModelProfile>) => setDraft((value) => ({ ...value, ...patch }))
   return (
     <div className={styles.modelSection}>

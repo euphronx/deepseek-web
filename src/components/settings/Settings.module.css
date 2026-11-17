@@ -594,6 +594,13 @@
   line-height: 18px;
 }
 
+/* Key 校验失败提示 */
+.verifyError {
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
 /* 上下文窗口与最大输出并排 */
 .capacityRow {
   display: flex;

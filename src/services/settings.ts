@@ -42,10 +42,10 @@ export type ModelProfile = {
 }
 
 /**
- * 一个模型供应商：端点 + 凭据 + 能力默认值，下挂一组模型。
+ * 一个模型供应商：端点 + 凭据 + 输入模态默认值，下挂一组模型。
  *
- * 与 DSH 的 provider → models 结构一致：凭据和地址属于 provider，
- * 各家模型共享；能力可以在 provider 上给默认值，也可以在每个模型上覆盖。
+ * 与 DSH 的 provider → models 结构一致：凭据、地址和输入模态默认值属于 provider；
+ * **容量（上下文窗口、输出上限）属于模型**，不在这里设。
  */
 export type ModelProvider = {
   id: string
@@ -54,14 +54,8 @@ export type ModelProvider = {
   /** API 根地址，不含 /chat/completions；留空用构建期默认地址 */
   baseUrl: string
   apiKey: string
-  /** provider 级默认：模型没声明输入模态时用它 */
+  /** provider 级默认输入模态：模型没声明时用它 */
   defaultInputModalities?: ModelModality[]
-  /** provider 级默认上下文窗口 */
-  defaultContextWindow?: number
-  /** provider 级默认输出上限 */
-  defaultMaxTokens?: number
-  /** provider 级默认推理强度：模型没声明时用它 */
-  defaultReasoningEfforts?: ReasoningEffort[]
   /** 该 provider 下可选的模型；至少一个 */
   models: ModelProfile[]
 }
@@ -77,11 +71,14 @@ export const DEFAULT_PROVIDER: ModelProvider = {
   apiKey: '',
   // DeepSeek 官方模型都能看图，这里给 provider 级默认，模型不必逐个声明
   defaultInputModalities: ['text', 'image'],
-  defaultContextWindow: 1_048_576,
   models: [
     {
       id: 'deepseek-flash',
       name: 'DeepSeek-V4-Flash',
+      // 与官方模型卡一致：1M 上下文，单次最多 384K 输出
+      contextWindow: 1_048_576,
+      maxTokens: 393_216,
+      inputModalities: ['text', 'image'],
       reasoningEfforts: ALL_EFFORTS,
     },
   ],
@@ -290,9 +287,6 @@ const normalizeProvider = (value: unknown): ModelProvider | null => {
     baseUrl: readString(item.baseUrl) ?? '',
     apiKey: readString(item.apiKey) ?? '',
     defaultInputModalities: readModalities(item.defaultInputModalities),
-    defaultContextWindow: readPositiveInt(item.defaultContextWindow),
-    defaultMaxTokens: readPositiveInt(item.defaultMaxTokens),
-    defaultReasoningEfforts: readEfforts(item.defaultReasoningEfforts),
     models,
   }
 }
@@ -324,19 +318,20 @@ const migrateLegacyEndpoints = (): ModelProvider[] | null => {
         name: readString(item.name) ?? id,
         baseUrl: readString(item.baseUrl) ?? '',
         apiKey: readString(item.apiKey) ?? '',
-        defaultInputModalities: readModalities(item.inputModalities),
-        defaultContextWindow: readPositiveInt(item.contextWindow),
-        defaultMaxTokens: readPositiveInt(item.maxTokens),
         models: [
           {
             id: modelId,
             // 模型名用模型标识，不用 provider 名：否则同一家几个模型会重名
             name: modelId,
-            // 旧结构把能力直接挂在端点上，迁移后原样落到模型上
+            // 旧结构把能力直接挂在端点上，迁移后原样落到这个模型上
+            contextWindow: readPositiveInt(item.contextWindow),
+            maxTokens: readPositiveInt(item.maxTokens),
+            inputModalities: readModalities(item.inputModalities),
             reasoningEfforts: readEfforts(item.reasoningEfforts),
           },
         ],
-      })    }
+      })
+    }
     return providers.length > 0 ? providers : null
   } catch {
     return null
@@ -354,15 +349,25 @@ const initialProviders = (): ModelProvider[] => {
           .map(normalizeProvider)
           .filter((provider): provider is ModelProvider => provider !== null)
         if (list.length > 0) {
-          // 内置 provider 由本文件维护默认能力，老存储里缺字段时补上
+          // 内置 provider 的模型由本文件维护，老存储里缺容量时按官方值补上
           return list.map((provider) =>
             provider.id === DEFAULT_PROVIDER.id
               ? {
                   ...provider,
                   defaultInputModalities:
                     provider.defaultInputModalities ?? DEFAULT_PROVIDER.defaultInputModalities,
-                  defaultContextWindow:
-                    provider.defaultContextWindow ?? DEFAULT_PROVIDER.defaultContextWindow,
+                  models: provider.models.map((model) => {
+                    const presets = DEFAULT_PROVIDER.models.find((item) => item.id === model.id)
+                    return presets
+                      ? {
+                          ...model,
+                          contextWindow: model.contextWindow ?? presets.contextWindow,
+                          maxTokens: model.maxTokens ?? presets.maxTokens,
+                          inputModalities: model.inputModalities ?? presets.inputModalities,
+                          reasoningEfforts: model.reasoningEfforts ?? presets.reasoningEfforts,
+                        }
+                      : model
+                  }),
                 }
               : provider
           )
@@ -472,53 +477,47 @@ export const modelAccepts = (
   modality: ModelModality
 ): boolean =>
   (model?.inputModalities ?? provider.defaultInputModalities ?? ['text']).includes(modality)
-
 /** 当前模型是否接受图片输入 */
 export const activeAcceptsImage = (): boolean =>
   modelAccepts(getActiveProvider(), getActiveModelProfile(), 'image')
 
 /**
  * 模型支持的推理强度，按由弱到强排列；空表示不支持深度思考。
- * 未声明时按不支持处理：第三方端点默认没有 DeepSeek 的 thinking 语义。
+ * 强度和模态不同，不设 provider 级默认：同一家的模型档位经常不一样，
+ * 未声明就按不支持处理，免得把不支持的档位发出去。
  */
-export const modelEfforts = (
-  provider: ModelProvider,
-  model: ModelProfile | undefined
-): ReasoningEffort[] => model?.reasoningEfforts ?? provider.defaultReasoningEfforts ?? []
+export const modelEfforts = (model: ModelProfile | undefined): ReasoningEffort[] =>
+  model?.reasoningEfforts ?? []
 
 /** 模型是否支持深度思考 */
-export const modelSupportsReasoning = (
-  provider: ModelProvider,
-  model: ModelProfile | undefined
-): boolean => modelEfforts(provider, model).length > 0
+export const modelSupportsReasoning = (model: ModelProfile | undefined): boolean =>
+  modelEfforts(model).length > 0
 
 /** 当前模型是否支持深度思考 */
 export const activeSupportsReasoning = (): boolean =>
-  modelSupportsReasoning(getActiveProvider(), getActiveModelProfile())
+  modelSupportsReasoning(getActiveModelProfile())
 
 /**
  * 把任意强度收敛到该模型支持的档位：本身支持就原样用，
  * 否则回落到该模型支持的最强档，避免把不支持的档位发出去。
  */
 export const resolveEffort = (
-  provider: ModelProvider,
   model: ModelProfile | undefined,
   effort: ReasoningEffort
 ): ReasoningEffort | undefined => {
-  const efforts = modelEfforts(provider, model)
+  const efforts = modelEfforts(model)
   if (efforts.length === 0) {
     return undefined
   }
   return efforts.includes(effort) ? effort : efforts[efforts.length - 1]
 }
 
-/** 当前模型的单次输出上限；模型未声明时继承 provider 默认 */
-export const getActiveMaxTokens = (): number | undefined =>
-  getActiveModelProfile().maxTokens ?? getActiveProvider().defaultMaxTokens
+/** 当前模型的单次输出上限；未声明时返回 undefined，由服务端决定 */
+export const getActiveMaxTokens = (): number | undefined => getActiveModelProfile().maxTokens
 
-/** 当前模型的上下文窗口；模型未声明时继承 provider 默认 */
+/** 当前模型的上下文窗口；未声明时返回 undefined，不裁剪历史 */
 export const getActiveContextWindow = (): number | undefined =>
-  getActiveModelProfile().contextWindow ?? getActiveProvider().defaultContextWindow
+  getActiveModelProfile().contextWindow
 
 export const setLocale = (locale: Locale) => {
   write(KEYS.locale, locale)
@@ -557,8 +556,15 @@ export const saveProvider = (provider: ModelProvider) => {
   )
 }
 
-/** 删除 provider；至少保留一个，删掉当前 provider 时切换到第一个并校正模型 */
+/**
+ * 删除 provider。
+ * 内置的 DeepSeek 不能删：它的端点、能力和默认值由本文件维护，
+ * 删掉之后没有可以回落的官方配置。其余 provider 至少保留一个。
+ */
 export const removeProvider = (id: string) => {
+  if (id === DEFAULT_PROVIDER.id) {
+    return
+  }
   const { providers, activeProviderId } = useSettings.getState()
   if (providers.length <= 1) {
     return
@@ -569,6 +575,10 @@ export const removeProvider = (id: string) => {
     setActiveModel(next[0].id, next[0].models[0].id)
   }
 }
+
+/** 是否为内置 provider；界面上不提供删除入口 */
+export const isBuiltinProvider = (provider: ModelProvider): boolean =>
+  provider.id === DEFAULT_PROVIDER.id
 
 /**
  * 切换当前模型。
