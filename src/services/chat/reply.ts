@@ -548,7 +548,8 @@ export const getContextRounds = (history: Message[]): [UserMessage, AssistantMes
 const estimateTokens = (text: string): number => {
   let tokens = 0
   for (const char of text) {
-    tokens += char.codePointAt(0)! > 0x2e80 ? 1 : 0.25
+    // codePointAt 在空串上返回 undefined，迭代出来的字符不会为空，缺省按 0 处理
+    tokens += (char.codePointAt(0) ?? 0) > 0x2e80 ? 1 : 0.25
   }
   return Math.ceil(tokens)
 }

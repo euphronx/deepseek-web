@@ -24,7 +24,9 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isString = (value: unknown): value is string => typeof value === 'string'
 const isNullableString = (value: unknown) => value == null || isString(value)
-const isIndex = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0
+/** 引用下标：非负整数；声明成类型谓词，调用处才能直接比较与赋值 */
+const isIndex = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 
 const TOOL_KINDS: ChatToolKind[] = [
   'search',
@@ -166,8 +168,8 @@ const readAnnotation = (value: unknown): ChatUrlCitation | null => {
         url_citation: {
           url,
           title: isString(title) ? title : url,
-          start_index: start as number,
-          end_index: end as number,
+          start_index: start,
+          end_index: end,
         },
       }
     : null
