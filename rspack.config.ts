@@ -82,7 +82,11 @@ export const createConfig = ({
     }),
     new rspack.DefinePlugin({ __API_ORIGIN__: JSON.stringify(apiOrigin) }),
     new rspack.CopyRspackPlugin({
-      patterns: [{ from: path.resolve(root, 'LICENSE'), to: 'LICENSE', toType: 'file' }],
+      patterns: [
+        { from: path.resolve(root, 'LICENSE'), to: 'LICENSE', toType: 'file' },
+        // 站点图标：与 index.html 里的相对路径对应
+        { from: path.resolve(root, 'public'), to: '.', noErrorOnMissing: true },
+      ],
     }),
   ],
   performance: { hints: false },

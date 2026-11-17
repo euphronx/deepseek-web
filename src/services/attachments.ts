@@ -7,8 +7,37 @@ import { ACCEPT_FILE_EXTS } from './uploadExts.js'
 
 /** 允许上传的扩展名，按扩展名白名单过滤，清单见 uploadExts.ts */
 export const ACCEPTED_EXTS = ACCEPT_FILE_EXTS
+/**
+ * 图片扩展名。与 uploadExts.ts 里的图片项一一对应，
+ * 只接受文本的端点据此把图片从文件选择器里滤掉。
+ */
+const IMAGE_EXTS = new Set([
+  'png',
+  'jpg',
+  'jpeg',
+  'svg',
+  'svgz',
+  'bmp',
+  'gif',
+  'webp',
+  'ico',
+  'xbm',
+  'dib',
+  'pjp',
+  'tif',
+  'pjpeg',
+  'avif',
+  'apng',
+  'tiff',
+  'jfif',
+  'avifs',
+])
 /** 选择文件对话框的过滤条件 */
 export const ACCEPT = ACCEPTED_EXTS.map((ext) => `.${ext}`).join(',')
+/** 端点不接受图片时的过滤条件：去掉图片扩展名 */
+export const ACCEPT_TEXT_ONLY = ACCEPTED_EXTS.filter((ext) => !IMAGE_EXTS.has(ext))
+  .map((ext) => `.${ext}`)
+  .join(',')
 /** 单文件大小上限与 Files API 一致 */
 export const MAX_SIZE_MB = 64
 /** 按 user_data 上传的文件（纯文本、代码、表格、电子书）原文件上限更小 */
@@ -28,22 +57,39 @@ export const isAcceptedExt = (name: string) => ACCEPTED_EXTS.includes(getFileExt
 /** 需要服务端做版面解析的文档；其余非图片文件（纯文本、代码、表格、电子书）无需解析 */
 const LAYOUT_RECOGNITION_EXTS = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx'])
 
-/** 上传时的 purpose：图片不传，PDF 与 Word、PPT 做版面解析，其余按 user_data 上传 */
-export const getUploadPurpose = (name: string, isImage: boolean): FilePurpose | null => {
-  if (isImage) {
-    return null
+/**
+ * 上传时的 purpose（必填）：PDF 与 Word、PPT 做版面解析；
+ * 图片与其余文件按 user_data 上传，服务端把表格与电子书转成 Markdown。
+ */
+export const getUploadPurpose = (name: string, isImage: boolean): FilePurpose =>
+  // 图片不做解析，直接作为视觉输入
+  isImage || !LAYOUT_RECOGNITION_EXTS.has(getFileExt(name))
+    ? 'user_data'
+    : 'rich_layout_recognition'
+
+/**
+ * 文件允许的最大体积（MB）。
+ * 图片按 Files API 的 64 MiB；版面解析的文档同样 64 MiB（服务端解析上限更高，但上传走 Files API）；
+ * 按 user_data 上传的文本、表格与电子书，服务端限制原始文件 32 MiB。
+ */
+const getMaxSizeMB = (file: File) => {
+  const mime = resolveMimeType(file)
+  if (isImage(mime)) {
+    return MAX_SIZE_MB
   }
-  return LAYOUT_RECOGNITION_EXTS.has(getFileExt(name)) ? 'rich_layout_recognition' : 'user_data'
+  return getUploadPurpose(file.name, false) === 'user_data' ? MAX_USER_DATA_SIZE_MB : MAX_SIZE_MB
 }
 
-/** 文件允许的最大体积（MB），按上传时的 purpose 区分 */
-const getMaxSizeMB = (file: File) =>
-  getUploadPurpose(file.name, isImage(resolveMimeType(file))) === 'user_data'
-    ? MAX_USER_DATA_SIZE_MB
-    : MAX_SIZE_MB
-
-/** 添加前校验：格式 → 大小 → 数量，任一不满足即整批不添加 */
-export const validateFiles = (files: File[], currentCount: number): TranslationMessage | null => {
+/**
+ * 添加前校验：格式 → 大小 → 数量，任一不满足即整批不添加。
+ * 这些是「文件本身有问题」，拒绝整批才说得通。
+ * 模态不在这里拦：端点不支持图片只该丢掉图片，其余可读文件照常加上，
+ * 那条分流由 filterByModality 处理。
+ */
+export const validateFiles = (
+  files: File[],
+  currentCount: number
+): TranslationMessage | null => {
   if (files.some((file) => !isAcceptedExt(file.name))) {
     return { key: 'uploadUnsupportedFormat' }
   }
@@ -55,6 +101,21 @@ export const validateFiles = (files: File[], currentCount: number): TranslationM
     return { key: 'uploadMaxFiles', params: { count: MAX_COUNT } }
   }
   return null
+}
+
+/**
+ * 端点不接受图片时把图片挑出去，其余文件原样保留。
+ * @returns `dropped` 为被丢弃的图片数，供调用方决定要不要提示
+ */
+export const filterByModality = (
+  files: File[],
+  acceptsImage: boolean
+): { kept: File[]; dropped: number } => {
+  if (acceptsImage) {
+    return { kept: files, dropped: 0 }
+  }
+  const kept = files.filter((file) => !isImage(resolveMimeType(file)))
+  return { kept, dropped: files.length - kept.length }
 }
 
 /**
@@ -210,13 +271,30 @@ export const cancelUpload = (id: string) => {
   setTask(id, null)
 }
 
-/** 各扩展名对应的 MIME：部分系统（如 Windows）给不出 file.type，按扩展名补齐 */
+/**
+ * 各扩展名对应的 MIME：部分系统（如 Windows）给不出 file.type，按扩展名补齐。
+ * 图片项要与 IMAGE_EXTS 保持一致，否则「格式过滤」和「模态校验」会得出不同结论。
+ */
 const MIME_BY_EXT: Record<string, string> = {
   png: 'image/png',
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
+  jfif: 'image/jpeg',
+  pjpeg: 'image/jpeg',
+  pjp: 'image/jpeg',
   gif: 'image/gif',
   webp: 'image/webp',
+  svg: 'image/svg+xml',
+  svgz: 'image/svg+xml',
+  bmp: 'image/bmp',
+  dib: 'image/bmp',
+  ico: 'image/x-icon',
+  xbm: 'image/x-xbitmap',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  avif: 'image/avif',
+  avifs: 'image/avif',
+  apng: 'image/apng',
 }
 
 /** 取文件的 MIME：优先用浏览器给出的类型，缺失时按扩展名推断 */

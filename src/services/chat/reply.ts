@@ -1,11 +1,19 @@
 import type {
-  AssistantBlockParam,
-  FileBlockParam,
-  MessageParam,
-  MessageStreamEvent,
+  ChatAnnotation,
+  ChatChunk,
+  ChatMessageParam,
+  ChatPart,
+  ChatToolCallParam,
+  ChatToolStep,
+  ChatUsage,
+  MessageUsage,
   OutputBlockStart,
-  TextBlockParam,
+  StopReason,
+  TextCitation,
+  WebFetchToolResultBlock,
 } from '../api/types.js'
+import { toBlocks } from '../api/toolCalls.js'
+import { buildSystemPrompt } from './prompt.js'
 import type {
   AssistantMessage,
   FileAttachment,
@@ -16,20 +24,11 @@ import type {
 } from './types.js'
 
 /**
- * 文件按 Files API 的 file_id（附件的 serverId）引用：图片用 image 块，其余用 document 块。
+ * 文件按 Files API 的 file_id（附件的 serverId）引用，图片与文档都用 file 内容块。
  * 发送前 streamReply 会先补齐 serverId；仍为 null 的是本地没有原件的附件，不进入请求。
  */
-const toFileBlocks = (files: FileAttachment[]): FileBlockParam[] =>
-  files.flatMap(({ serverId, isImage }) =>
-    serverId
-      ? [
-          {
-            type: isImage ? 'image' : 'document',
-            source: { type: 'file', file_id: serverId },
-          },
-        ]
-      : []
-  )
+const toFileParts = (files: FileAttachment[]): ChatPart[] =>
+  files.flatMap(({ serverId }) => (serverId ? [{ type: 'file', file_id: serverId }] : []))
 
 const toReplyBlock = (block: OutputBlockStart, now: number): ReplyBlock | null => {
   switch (block.type) {
@@ -66,74 +65,305 @@ const updateBlock = (
 }
 
 /**
- * 把一个流式事件合并进回复：只追加可识别的内容块，用本次请求的临时索引映射处理增量。
- * 跳过的块不占位；续写直接追加到已有内容之后，message_delta 更新结束原因与累计用量。
+ * 流式处理的游标：思考与正文按到达顺序累积，
+ * 工具调用与引用在最后一个 chunk 才完整下发，届时按 id 与码点偏移回填。
+ */
+export type StreamState = {
+  /** 当前正在累积的正文块，-1 表示没有 */
+  textIndex: number
+  /** 当前正在累积的思考块，-1 表示没有 */
+  thinkingIndex: number
+  /** 工具调用 id → 该调用在 blocks 里的起始下标 */
+  toolBlocks: Map<string, number>
+  /** 工具调用 id → 该调用当前占用的块数（调用块 + 结果块，进行中为 1） */
+  toolSpans: Map<string, number>
+  /** 末块 finish_reason 对应的结束原因 */
+  stopReason?: StopReason
+  /** 末块携带的会话标题 */
+  title?: string
+}
+
+export const createStreamState = (): StreamState => ({
+  textIndex: -1,
+  thinkingIndex: -1,
+  toolBlocks: new Map(),
+  toolSpans: new Map(),
+})
+
+/** 服务端用量换算成本地用量；服务端不返回缓存创建量 */
+const toUsage = (usage: ChatUsage): MessageUsage => ({
+  input_tokens: usage.prompt_cache_miss_tokens,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: usage.prompt_cache_hit_tokens,
+  output_tokens: usage.completion_tokens,
+  ...(usage.server_tool_use
+    ? {
+        server_tool_use: {
+          web_search_requests: usage.server_tool_use.tool_search ?? 0,
+          tool_search: usage.server_tool_use.tool_search ?? 0,
+        },
+      }
+    : {}),
+})
+
+const FINISH_REASONS: Record<string, StopReason> = {
+  stop: 'end_turn',
+  length: 'max_tokens',
+  tool_calls: 'tool_use',
+  content_filter: 'refusal',
+  // 生成被中断或资源不足：按正常结束处理，状态由调用方归为已停止
+  aborted: 'end_turn',
+  insufficient_system_resource: 'end_turn',
+}
+
+/**
+ * 把引用按码点偏移插回正文，切成若干文本块。
+ * 服务端给出左闭右开的区间，同一区间可以有多条来源；
+ * 越界或非正长度（end <= start）的引用被丢弃。
+ */
+const splitByCitations = (
+  text: string,
+  annotations: ChatAnnotation[]
+): { text: string; citations: TextCitation[] }[] => {
+  // 服务端偏移按 Unicode 码点计，不能用字符串下标
+  const points = Array.from(text)
+  const length = points.length
+  const marks = annotations
+    .map((annotation) => {
+      const end = Math.min(Math.max(annotation.url_citation.end_index, 0), length)
+      return {
+        end,
+        citation: {
+          type: 'web_search_result_location' as const,
+          url: annotation.url_citation.url,
+          title: annotation.url_citation.title || null,
+          // 引用处之前的全部正文，去掉首尾空白
+          cited_text: points.slice(0, end).join('').trim(),
+          encrypted_index: '',
+        } satisfies TextCitation,
+      }
+    })
+    .filter((mark) => mark.end > 0)
+    .sort((a, b) => a.end - b.end)
+
+  if (marks.length === 0) {
+    return [{ text, citations: [] }]
+  }
+
+  const segments: { text: string; citations: TextCitation[] }[] = []
+  let cursor = 0
+  for (const mark of marks) {
+    // 同一位置的多个引用合并进同一段
+    const last = segments.at(-1)
+    if (last && mark.end === cursor) {
+      last.citations.push(mark.citation)
+      continue
+    }
+    segments.push({ text: points.slice(cursor, mark.end).join(''), citations: [mark.citation] })
+    cursor = mark.end
+  }
+  if (cursor < length) {
+    segments.push({ text: points.slice(cursor).join(''), citations: [] })
+  }
+  return segments
+}
+
+/**
+ * 末块处理：工具调用与引用一次性到达，按 id 与码点偏移回填。
+ * 流式进度事件已建过的块随之替换，签名与结果以此为准。
+ */
+const applyFinalPayload = (
+  reply: AssistantMessage,
+  annotations: ChatAnnotation[] | undefined,
+  steps: ChatToolStep[] | undefined,
+  now: number
+): AssistantMessage => {
+  if (!annotations && !steps) {
+    return reply
+  }
+  const calls = steps?.flatMap((step) => step.calls) ?? []
+  // 末块是权威数据：每个调用用它自己的完整块集合替换流式期间的占位
+  const inserts = new Map<string, ReplyBlock[]>()
+  for (const call of calls) {
+    inserts.set(
+      call.id,
+      toBlocks(call).flatMap((block) => {
+        const converted = toReplyBlock(block, now)
+        return converted ? [converted] : []
+      })
+    )
+  }
+  const applied = new Set<string>()
+  const blocks: ReplyBlock[] = []
+
+  let texts: { text: string; citations: TextCitation[] }[] = []
+  const flushText = () => {
+    for (const segment of texts) {
+      blocks.push({ type: 'text', text: segment.text, citations: segment.citations })
+    }
+    texts = []
+  }
+
+  for (const block of reply.blocks) {
+    if (block.type === 'text') {
+      texts.push({ text: block.text, citations: block.citations ?? [] })
+      continue
+    }
+    flushText()
+    if (block.type === 'server_tool_use') {
+      const insert = inserts.get(block.id)
+      if (insert) {
+        blocks.push(...insert)
+        applied.add(block.id)
+      } else {
+        blocks.push(block)
+      }
+      continue
+    }
+    // 结果块已随调用一起插入，跳过流式期间的占位
+    if (
+      (block.type === 'web_search_tool_result' || block.type === 'web_fetch_tool_result') &&
+      calls.some((call) => call.id === block.tool_use_id)
+    ) {
+      continue
+    }
+    blocks.push(block)
+  }
+  flushText()
+
+  // 进度事件里没出现过的调用（例如整轮只下发末块）追加在末尾
+  for (const call of calls) {
+    if (!applied.has(call.id)) {
+      blocks.push(...(inserts.get(call.id) ?? []))
+    }
+  }
+
+  // 引用作用于整轮正文：先把所有正文合并、按码点重新切块
+  if (annotations && annotations.length > 0) {
+    const whole = blocks
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+      .join('')
+    if (whole) {
+      const segments = splitByCitations(whole, annotations)
+      const rebuilt: ReplyBlock[] = []
+      let replaced = false
+      for (const block of blocks) {
+        if (block.type !== 'text') {
+          rebuilt.push(block)
+          continue
+        }
+        if (!replaced) {
+          rebuilt.push(...segments.map((segment) => ({ type: 'text' as const, ...segment })))
+          replaced = true
+        }
+      }
+      return { ...reply, blocks: rebuilt }
+    }
+  }
+
+  return { ...reply, blocks }
+}
+
+/**
+ * 把一个流式 chunk 合并进回复。
+ * 思考与正文先按到达顺序累积；工具调用、引用与结束原因在最后一个 chunk 一次性到达。
  */
 export const applyEvent = (
   reply: AssistantMessage,
-  event: MessageStreamEvent,
+  chunk: ChatChunk,
   now: number,
-  blockIndexes: Map<number, number>
+  state: StreamState
 ): AssistantMessage => {
-  const next: AssistantMessage =
-    reply.status === 'streaming' ? reply : { ...reply, status: 'streaming' }
-  switch (event.type) {
-    case 'message_start':
-      return { ...next, usage: event.message.usage ?? next.usage }
-    case 'content_block_start': {
-      blockIndexes.delete(event.index)
-      const block = toReplyBlock(event.content_block, now)
-      if (!block) {
-        // 客户端工具内容不保存；未完成的工具往返也不能作为续写前缀。
-        return event.content_block.type === 'tool_use' ? { ...next, prefix: false } : next
-      }
-      blockIndexes.set(event.index, next.blocks.length)
-      return { ...next, blocks: [...next.blocks, block] }
-    }
-    case 'content_block_delta': {
-      const index = blockIndexes.get(event.index)
-      if (index === undefined) {
-        return next
-      }
-      const { delta } = event
-      return updateBlock(next, index, (block) => {
-        if (block.type === 'text' && delta.type === 'text_delta') {
-          return { ...block, text: block.text + delta.text }
-        }
-        if (block.type === 'thinking' && delta.type === 'thinking_delta') {
-          return { ...block, thinking: block.thinking + delta.thinking }
-        }
-        if (block.type === 'thinking' && delta.type === 'signature_delta') {
-          return { ...block, signature: (block.signature ?? '') + delta.signature }
-        }
-        if (block.type === 'text' && delta.type === 'citations_delta') {
-          return { ...block, citations: [...(block.citations ?? []), delta.citation] }
-        }
-        return block
-      })
-    }
-    case 'content_block_stop': {
-      const index = blockIndexes.get(event.index)
-      if (index === undefined) {
-        return next
-      }
-      blockIndexes.delete(event.index)
-      return updateBlock(next, index, (block) =>
-        block.type === 'thinking' && block.startedAt !== undefined && block.endedAt === undefined
-          ? { ...block, endedAt: now }
-          : block
-      )
-    }
-    case 'message_delta':
-      return {
-        ...next,
-        stopReason: event.delta.stop_reason,
-        stopDetails: event.delta.stop_details,
-        usage: event.usage ?? next.usage,
-      }
-    default:
-      return next
+  const choice = chunk.choices[0]
+  let updated: AssistantMessage = reply.status === 'streaming' ? reply : { ...reply, status: 'streaming' }
+  if (chunk.usage) {
+    updated = { ...updated, usage: toUsage(chunk.usage) }
   }
+  if (!choice) {
+    return updated
+  }
+
+  const { delta } = choice
+
+  if (delta.reasoning_content) {
+    if (state.thinkingIndex < 0) {
+      state.thinkingIndex = updated.blocks.length
+      updated = {
+        ...updated,
+        blocks: [
+          ...updated.blocks,
+          { type: 'thinking', thinking: '', signature: '', startedAt: now },
+        ],
+      }
+    }
+    state.textIndex = -1
+    const thinking = delta.reasoning_content
+    updated = updateBlock(updated, state.thinkingIndex, (block) =>
+      block.type === 'thinking' ? { ...block, thinking: block.thinking + thinking } : block
+    )
+  }
+
+  if (delta.content) {
+    if (state.textIndex < 0) {
+      state.textIndex = updated.blocks.length
+      updated = {
+        ...updated,
+        blocks: [...updated.blocks, { type: 'text', text: '', citations: [] }],
+      }
+    }
+    const text = delta.content
+    updated = updateBlock(updated, state.textIndex, (block) =>
+      block.type === 'text' ? { ...block, text: block.text + text } : block
+    )
+  }
+
+  // 工具调用进度：先占位，末块再用完整数据替换
+  const event = choice.server_tool_event
+  if (event?.type === 'step_reasoning_done') {
+    updated = updateBlock(updated, state.thinkingIndex, (block) =>
+      block.type === 'thinking' && block.endedAt === undefined
+        ? { ...block, endedAt: now }
+        : block
+    )
+  }
+  if (event && event.type !== 'step_reasoning_done') {
+    const blocks = toBlocks(event.call).flatMap((block) => {
+      const converted = toReplyBlock(block, now)
+      return converted ? [converted] : []
+    })
+    const known = state.toolBlocks.get(event.call.id)
+    if (known === undefined) {
+      state.toolBlocks.set(event.call.id, updated.blocks.length)
+      state.toolSpans.set(event.call.id, blocks.length)
+      state.textIndex = -1
+      state.thinkingIndex = -1
+      updated = { ...updated, blocks: [...updated.blocks, ...blocks] }
+    } else {
+      // 进度事件不带 signature，用最新块替换该调用原有的整段
+      const span = state.toolSpans.get(event.call.id) ?? blocks.length
+      state.toolSpans.set(event.call.id, blocks.length)
+      updated = {
+        ...updated,
+        blocks: [...updated.blocks.slice(0, known), ...blocks, ...updated.blocks.slice(known + span)],
+      }
+    }
+  }
+
+  if (choice.finish_reason !== null) {
+    state.stopReason = FINISH_REASONS[choice.finish_reason] ?? 'end_turn'
+    if (delta.title) {
+      state.title = delta.title
+    }
+    updated = {
+      ...updated,
+      stopReason: state.stopReason,
+      ...(state.stopReason === 'refusal'
+        ? { stopDetails: { type: 'refusal' as const, category: null, explanation: null } }
+        : {}),
+    }
+  }
+
+  return applyFinalPayload(updated, delta.annotations, delta.server_tool_calls, now)
 }
 
 /**
@@ -202,30 +432,28 @@ const isUsableReply = (message: Message): message is AssistantMessage =>
   getReplyText(message) !== ''
 
 /** 有文件时用内容块数组：先文件后文本，文件按 Files API 的 file_id 引用 */
-const toUserParam = ({ content, files }: UserMessage): MessageParam => {
-  const blocks = toFileBlocks(files)
-  return blocks.length === 0
+const toUserParam = ({ content, files }: UserMessage): ChatMessageParam => {
+  const parts = toFileParts(files)
+  return parts.length === 0
     ? { role: 'user', content }
     : {
         role: 'user',
-        content: [...blocks, ...(content ? [{ type: 'text' as const, text: content }] : [])],
+        content: [...parts, ...(content ? [{ type: 'text' as const, text: content }] : [])],
       }
 }
 
 /**
- * assistant 的内容块按历史与续写场景转换：
- * - 历史思考及其签名不回传；开启思考时续写只保留本轮非空白思考及其签名；
- * - 文本块去掉 citations（服务端忽略）。相邻文本直接拼接，被思考或工具隔开的文本用空行连接；
- *   省略历史思考后仍保留其前后正文的空行；
- * - 工具调用和结果只保留 kind 为 read_link 的块，其他历史工具块不回传；
- * - 阅读链接结果原样回传，保留 signature：服务端解密后将页面拼回该轮提问末尾；
+ * assistant 的正文与工具调用按历史与续写场景转换：
+ * - 历史思考不回传（服务端会丢弃）；续写时只保留本轮非空白思考，作为 reasoning_content 前缀；
+ * - 文本块去掉 citations（服务端忽略），被工具隔开的正文用空行连接；
+ * - 工具调用只保留 kind 为 read_link 的，其他历史工具块不回传；
+ * - 阅读链接连同 signature 原样回传：服务端解密后将页面拼回该轮提问末尾。
  */
 const toAssistantParam = (
   { blocks }: AssistantMessage,
   prefix = false,
   thinking = false
-): Extract<MessageParam, { role: 'assistant' }> => {
-  const content: AssistantBlockParam[] = []
+): Extract<ChatMessageParam, { role: 'assistant' }> => {
   // 成功阅读的网页靠签名恢复正文；缺少有效签名时，调用与结果都不回传。
   const unsignedReadLinks = new Set(
     blocks.flatMap((block) =>
@@ -237,49 +465,66 @@ const toAssistantParam = (
         : []
     )
   )
-  /** 正在拼接的文本块；遇到任何非文本块（含不回传的思考块）就结束 */
-  let text: TextBlockParam | null = null
+  const fetches = new Map<string, WebFetchToolResultBlock>()
   for (const block of blocks) {
-    // 空思考不改变续写位置，也不应把两段正文隔开，导致后端额外插入空行。
-    if (prefix && block.type === 'thinking' && !block.thinking.trim()) {
+    if (block.type === 'web_fetch_tool_result') {
+      fetches.set(block.tool_use_id, block)
+    }
+  }
+
+  let content = ''
+  let joined = false
+  let reasoning = ''
+  const calls: ChatToolCallParam[] = []
+
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      content = joined ? `${content}\n\n${block.text}` : block.text
+      joined = true
       continue
     }
-    if (block.type === 'text') {
-      if (text) {
-        text.text += block.text
-      } else {
-        const previous = content.at(-1)
-        text = {
-          type: 'text',
-          text: `${previous?.type === 'text' ? '\n\n' : ''}${block.text}`,
-        }
-        content.push(text)
+    if (block.type === 'thinking') {
+      // 续写保留本轮思考，历史轮次的思考省略。
+      if (prefix && thinking && block.thinking.trim()) {
+        reasoning += block.thinking
       }
       continue
     }
-    text = null
-    if (prefix && thinking && block.type === 'thinking') {
-      // 续写保留本轮思考，历史轮次的思考省略。
-      const { type, thinking, signature } = block
-      content.push({ type, thinking, signature: signature ?? '' })
-    } else if (
-      block.type === 'server_tool_use' &&
-      block.kind === 'read_link' &&
-      !unsignedReadLinks.has(block.id)
+    if (
+      block.type !== 'server_tool_use' ||
+      block.kind !== 'read_link' ||
+      unsignedReadLinks.has(block.id)
     ) {
-      const { type, id, name, input, kind } = block
-      content.push({ type, id, name, input, kind })
-    } else if (
-      block.type === 'web_fetch_tool_result' &&
-      block.kind === 'read_link' &&
-      !unsignedReadLinks.has(block.tool_use_id)
-    ) {
-      content.push(block)
+      continue
     }
+    const fetch = fetches.get(block.id)
+    if (!fetch || fetch.content.type !== 'web_fetch_result' || !fetch.signature?.trim()) {
+      continue
+    }
+    calls.push({
+      index: calls.length,
+      id: block.id,
+      type: 'deepseek_read_url',
+      kind: 'read_link',
+      action: { type: 'read_link', url: fetch.content.url },
+      status: 'completed',
+      page: {
+        url: fetch.content.url,
+        title: fetch.content.content.title,
+        published_at: fetch.content.published_at,
+      },
+      signature: fetch.signature,
+    })
   }
+
   return {
     role: 'assistant',
-    content: content.filter((block) => block.type !== 'text' || block.text !== ''),
+    content: content.trim() ? content : '',
+    ...(prefix ? { prefix: true } : {}),
+    ...(prefix && thinking && reasoning.trim() ? { reasoning_content: reasoning } : {}),
+    ...(calls.length > 0
+      ? { server_tool_calls: [{ index: 0, calls }] }
+      : {}),
   }
 }
 
@@ -297,28 +542,91 @@ export const getContextRounds = (history: Message[]): [UserMessage, AssistantMes
 }
 
 /**
- * 把会话转成请求的 messages：只保留「提问 + 有回答的回复」成对的轮次，最后接上本轮提问。
- * 失败或没有回答的轮次不进上下文。续写时末尾再带上本轮 assistant。
+ * 粗估一段文本的 token 数：中文按 1 字 1 token，其余按 4 字符 1 token。
+ * 只用于判断上下文是否超窗，不参与计费，错了也只是多丢或少丢几轮。
+ */
+const estimateTokens = (text: string): number => {
+  let tokens = 0
+  for (const char of text) {
+    tokens += char.codePointAt(0)! > 0x2e80 ? 1 : 0.25
+  }
+  return Math.ceil(tokens)
+}
+
+/** 一条请求消息的粗略 token 数：正文 + 附件按固定开销计 */
+const estimateMessageTokens = (message: ChatMessageParam): number => {
+  const content = message.content
+  if (typeof content === 'string') {
+    return estimateTokens(content)
+  }
+  // 内容块：文本块按字算，文件与图片块给一个固定的经验开销
+  return content.reduce(
+    (sum, part) => sum + (part.type === 'text' ? estimateTokens(part.text) : 1200),
+    0
+  )
+}
+
+/**
+ * 如果超出上下文窗口，从最早的轮次开始丢，直到放得下。
+ * 至少保留最近一轮——全丢光等于没带历史，反而更难答对。
+ * `contextWindow` 未声明时原样返回，不猜。
+ */
+const trimRounds = (
+  rounds: [UserMessage, AssistantMessage][],
+  contextWindow: number | undefined,
+  fixedTokens: number
+): [UserMessage, AssistantMessage][] => {
+  if (contextWindow === undefined) {
+    return rounds
+  }
+  const cost = (round: [UserMessage, AssistantMessage]) =>
+    estimateMessageTokens(toUserParam(round[0])) + estimateMessageTokens(toAssistantParam(round[1]))
+  let total = fixedTokens + rounds.reduce((sum, round) => sum + cost(round), 0)
+  let start = 0
+  while (total > contextWindow && start < rounds.length - 1) {
+    total -= cost(rounds[start])
+    start++
+  }
+  return rounds.slice(start)
+}
+
+/**
+ * 把会话转成请求的 messages：系统提示词在最前，其后只保留「提问 + 有回答的回复」成对的轮次，
+ * 最后接上本轮提问。失败或没有回答的轮次不进上下文。续写时末尾再带上本轮 assistant。
+ *
+ * `deepseek` 为 false（自定义的第三方端点）时不插入 latest_reminder：
+ * 那是 DeepSeek 的扩展角色，标准 OpenAI 兼容端点会直接拒绝。
+ *
+ * `contextWindow` 声明了窗口大小后，历史按粗略 token 估算从最早的轮次开始裁剪。
  */
 export const toRequestMessages = (
   history: Message[],
   question: UserMessage,
   prefix?: AssistantMessage,
   thinking = prefix?.thinking ?? false,
-  latestReminder?: string
-): MessageParam[] => {
-  const messages: MessageParam[] = []
+  latestReminder?: string,
+  deepseek = true,
+  contextWindow?: number
+): ChatMessageParam[] => {
+  const system: ChatMessageParam = { role: 'system', content: buildSystemPrompt() }
+  // 系统提示词、本轮提问与 latest_reminder 是必须保留的固定开销
+  const fixedTokens =
+    estimateMessageTokens(system) +
+    estimateMessageTokens(toUserParam(question)) +
+    (latestReminder ? estimateTokens(latestReminder) : 0)
+  const rounds = trimRounds(getContextRounds(history), contextWindow, fixedTokens)
+  const messages: ChatMessageParam[] = [system]
   let previousReminder: string | undefined
   const appendReminder = (reminder: string | undefined) => {
     // 仅在当前分支首次出现或内容变化时插入快照；缺少快照的消息保持原有内容。
-    if (reminder && reminder !== previousReminder) {
+    if (deepseek && reminder && reminder !== previousReminder) {
       messages.push({ role: 'latest_reminder', content: reminder })
       previousReminder = reminder
     }
   }
-  for (const [user, reply] of getContextRounds(history)) {
+  for (const [user, reply] of rounds) {
     // 历史提问没有文字、附件也都没有 serverId 时，提问为空，连同回答一起省略。
-    if (!user.content && toFileBlocks(user.files).length === 0) {
+    if (!user.content && toFileParts(user.files).length === 0) {
       continue
     }
     appendReminder(reply.latestReminder)
@@ -329,13 +637,7 @@ export const toRequestMessages = (
   if (prefix?.prefix) {
     const assistant = toAssistantParam(prefix, true, thinking)
     // 没有非空白正文或有效思考时直接重发原问题，避免服务端拒绝空 Prefill。
-    if (
-      assistant.content.some(
-        (block) =>
-          (block.type === 'text' && block.text.trim()) ||
-          (block.type === 'thinking' && block.thinking.trim())
-      )
-    ) {
+    if (assistant.content.trim() || assistant.reasoning_content?.trim()) {
       messages.push(assistant)
     }
   }

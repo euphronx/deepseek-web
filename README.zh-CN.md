@@ -62,7 +62,7 @@ git fetch upstream
 git merge upstream/main
 ```
 
-聊天默认使用 `deepseek-flash`，通过 Anthropic 兼容的 Messages / Files API 通信；语音使用 ASR / TTS 接口。请求使用搜索、链接阅读、标题和 `latest_reminder` 等扩展，接入服务需支持相应能力。附件实际支持的格式以服务端校验为准。
+聊天默认使用 `deepseek-flash`，通过 OpenAI 兼容的 Chat Completions 与 Files API 通信，续写请求走 beta 端点；语音使用同一服务源的 ASR / TTS 接口。请求使用搜索、链接阅读、标题和 `latest_reminder` 等扩展，接入服务需支持相应能力。回答可以用 `![说明](地址)` 引用图片，仅渲染 `http(s)` 与内联 `data:image/...` 来源。附件实际支持的格式以服务端校验为准。
 
 ```text
 src/

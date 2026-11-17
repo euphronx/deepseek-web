@@ -7,6 +7,7 @@
   font-weight: 600;
 }
 
+/* 正文图片由 MarkdownImage 组件接管尺寸与圆角，这里只兜住未走组件的情况 */
 .ds-markdown img {
   max-width: 100%;
 }

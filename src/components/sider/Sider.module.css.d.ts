@@ -2,6 +2,11 @@ declare const styles: {
   readonly "sider": string;
   readonly "top": string;
   readonly "appName": string;
+  readonly "brand": string;
+  readonly "topActions": string;
+  readonly "search": string;
+  readonly "searchInput": string;
+  readonly "empty": string;
   readonly "newChat": string;
   readonly "newChatIcon": string;
   readonly "listWrap": string;

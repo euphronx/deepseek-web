@@ -9,7 +9,12 @@ import styles from './Settings.module.css'
 
 /** API Key 的编辑状态：输入框与移动端底部的「确定」按钮共用 */
 export const useApiKeyEditor = () => {
-  const apiKey = useSettings((state) => state.apiKey)
+  // 订阅 provider 变化：切换模型后输入框要跟着显示新 provider 的 Key
+  const apiKey = useSettings((state) => {
+    const provider =
+      state.providers.find((item) => item.id === state.activeProviderId) ?? state.providers[0]
+    return provider?.apiKey ?? ''
+  })
   const [editing, setEditing] = useState(false)
   const form = useApiKeyForm(() => setEditing(false))
   return { apiKey, editing, setEditing, form, showInput: !apiKey || editing }

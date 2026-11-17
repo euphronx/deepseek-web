@@ -24,7 +24,7 @@
     &:hover,
     &.active {
       .action {
-        display: flex;
+        visibility: visible;
       }
     }
   }
@@ -39,10 +39,16 @@
   line-height: 18px;
 }
 
+/*
+ * 菜单以这个容器里的按钮为定位锚点。
+ * 这里必须保持有盒子（用 visibility 隐藏而不是 display:none）：
+ * display:none 会让 getBoundingClientRect 全为 0，鼠标移开会话项时菜单会跳到左上角。
+ */
 .action {
-  display: none;
+  display: flex;
   flex-shrink: 0;
   margin-left: 4px;
+  visibility: hidden;
 }
 
 .renameInput {
@@ -61,7 +67,7 @@
 
 @media (hover: none) {
   .action {
-    display: flex;
+    visibility: visible;
   }
 }
 

@@ -6,9 +6,11 @@ import {
   IconDownloadOutline16,
   IconFollowsystemOutline16,
   IconLightOutline16,
+  IconModelOutline16,
   IconSettingsOutline16,
   IconUploadOutline14,
 } from '../base/icons.js'
+import { createId } from '../../utils/id.js'
 import {
   BackupError,
   clearHistory,
@@ -19,12 +21,20 @@ import { useIsMobile } from '../../app/viewport.js'
 import { useChatStore } from '../../services/chat/store.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
+  ALL_EFFORTS,
+  DEFAULT_PROVIDER,
   isChineseBrowser,
+  modelAccepts,
+  removeProvider,
+  saveProvider,
+  setActiveModel,
   setLocale,
   setLocation,
   setThemePreference,
   setTtsVoice,
   useSettings,
+  type ModelProfile,
+  type ModelProvider,
   type ThemePreference,
 } from '../../services/settings.js'
 import { useTranslate, type TranslationKey, type TranslationMessage } from '../../i18n/index.js'
@@ -37,7 +47,8 @@ import { closeSettings, useSettingsDialog, type SettingsSection } from './settin
 import styles from './Settings.module.css'
 
 /**
- * 设置弹窗：分「通用设置」（主题、语言、朗读音色、位置）与「数据管理」（API Key、导入、导出、删除）。
+ * 设置弹窗：分「通用设置」（主题、语言、朗读音色、位置）、「模型」（对话模型与 API Key）
+ * 与「数据管理」（导入、导出、删除）。
  * 桌面端为居中弹窗、左侧导航；移动端为底部弹层、导航横排在内容上方
  */
 export const SettingsDialog = () => {
@@ -51,6 +62,7 @@ const sections: { value: SettingsSection; label: TranslationKey; icon: ReactNode
     label: 'settingDialogAsideGeneralOptionLabel',
     icon: <IconSettingsOutline16 />,
   },
+  { value: 'models', label: 'settingDialogAsideModelOptionLabel', icon: <IconModelOutline16 /> },
   { value: 'data', label: 'settingDialogAsideDataOptionLabel', icon: <IconDataOutline16 /> },
 ]
 
@@ -101,6 +113,8 @@ const SettingsContent = () => {
               <TtsVoiceSetting />
               <LocationSetting />
             </>
+          ) : section === 'models' ? (
+            <ModelSettings />
           ) : (
             <>
               <ApiKeyField editor={apiKeyEditor} />
@@ -404,6 +418,454 @@ const errorStatus = (key: TranslationKey, error: unknown): Status => ({
     : { params: { message: error instanceof Error ? error.message : String(error) } }),
   error: true,
 })
+
+/** 模型设置：供应商列表；点进去编辑该供应商及其模型 */
+const ModelSettings = () => {
+  const t = useTranslate()
+  const providers = useSettings((state) => state.providers)
+  const activeProviderId = useSettings((state) => state.activeProviderId)
+  const activeModelId = useSettings((state) => state.activeModelId)
+  const [editing, setEditing] = useState<ModelProvider | null>(null)
+
+  if (editing) {
+    return <ProviderForm provider={editing} onDone={() => setEditing(null)} />
+  }
+
+  return (
+    <div className={styles.modelSection}>
+      <div className={styles.modelHeading}>
+        <div className={styles.label}>{t('settingDialogAsideModelOptionLabel')}</div>
+        <div className={styles.description}>{t('modelSectionHint')}</div>
+      </div>
+      <div className={styles.modelList}>
+        {providers.map((provider) => {
+          const model =
+            provider.models.find((item) => item.id === activeModelId) ?? provider.models[0]
+          const active = provider.id === activeProviderId
+          return (
+            <div key={provider.id} className={styles.modelItem}>
+              <button
+                type="button"
+                className={styles.modelPick}
+                title={t('modelUse')}
+                onClick={() => setActiveModel(provider.id, model.id)}
+              >
+                <span className={styles.modelName}>{provider.name}</span>
+                {provider.id !== DEFAULT_PROVIDER.id ? (
+                  <span className={styles.modelTag}>{t('modelCustom')}</span>
+                ) : null}
+                <span
+                  className={clsx(styles.modelDot, active && styles.modelDotActive)}
+                  aria-label={active ? t('modelInUse') : undefined}
+                />
+                {/* 只有一个模型时 provider 名就够，多模型才显示当前用的是哪个 */}
+                {provider.models.length > 1 ? (
+                  <span className={styles.modelMeta}>{active ? model.name : ''}</span>
+                ) : null}
+                {modelAccepts(provider, model, 'image') ? (
+                  <span className={styles.modelCapability}>{t('modelInputImage')}</span>
+                ) : null}
+                {provider.models.length > 1 ? (
+                  <span className={styles.modelCapability}>
+                    {provider.models.length} {t('modelCountSuffix')}
+                  </span>
+                ) : null}
+              </button>
+              <div className={styles.modelActions}>
+                <button
+                  type="button"
+                  className={styles.modelAction}
+                  onClick={() => setEditing(provider)}
+                >
+                  {t('modelEdit')}
+                </button>
+                {providers.length > 1 ? (
+                  <button
+                    type="button"
+                    className={clsx(styles.modelAction, styles.modelActionDanger)}
+                    onClick={() => removeProvider(provider.id)}
+                  >
+                    {t('modelDelete')}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <button
+        type="button"
+        className={styles.modelAdd}
+        onClick={() =>
+          setEditing({
+            id: createId(),
+            name: t('providerDefaultName'),
+            baseUrl: '',
+            apiKey: '',
+            models: [{ id: '', name: t('modelDefaultName') }],
+          })
+        }
+      >
+        {t('providerAdd')}
+      </button>
+      <div className={styles.modelNote}>{t('modelExtensionsHint')}</div>
+    </div>
+  )
+}
+
+/** 推理强度的显示名，与输入框的模型菜单保持一致：直接用 API 枚举值 */
+const effortLabelOf = (value: string) => value[0].toUpperCase() + value.slice(1)
+
+/**
+ * 把容量输入框的文字解析成正整数：空串清除声明，非数字或非正数一律视为清除。
+ * 不做单位换算——这里填的是原始 token 数，写 128K 只会被当成非法值。
+ */
+const parseCapacity = (text: string): number | undefined => {
+  const trimmed = text.trim()
+  if (!trimmed) {
+    return undefined
+  }
+  const value = Number(trimmed)
+  return Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+/** 供应商编辑：端点与凭据，外加它下面的模型列表 */
+const ProviderForm = ({
+  provider,
+  onDone,
+}: {
+  provider: ModelProvider
+  onDone: () => void
+}) => {
+  const t = useTranslate()
+  const [draft, setDraft] = useState(provider)
+  const [editingModel, setEditingModel] = useState<number | null>(null)
+  const update = (patch: Partial<ModelProvider>) => setDraft((value) => ({ ...value, ...patch }))
+
+  if (editingModel !== null) {
+    return (
+      <ModelForm
+        model={draft.models[editingModel]}
+        onCancel={() => setEditingModel(null)}
+        onSave={(model) => {
+          setDraft((value) => ({
+            ...value,
+            models: value.models.map((item, index) => (index === editingModel ? model : item)),
+          }))
+          setEditingModel(null)
+        }}
+      />
+    )
+  }
+
+  return (
+    <div className={styles.modelSection}>
+      <div className={styles.modelHeading}>
+        <div className={styles.label}>{t('providerSectionLabel')}</div>
+        <div className={styles.description}>{t('modelBaseUrlHint')}</div>
+      </div>
+      <div className={styles.form}>
+        <label className={styles.formField}>
+          <span className={styles.formLabel}>{t('modelNameLabel')}</span>
+          <input
+            className={styles.formInput}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder={t('modelNamePlaceholder')}
+            value={draft.name}
+            onChange={(event) => update({ name: event.target.value })}
+          />
+        </label>
+        <label className={styles.formField}>
+          <span className={styles.formLabel}>{t('modelBaseUrlLabel')}</span>
+          <input
+            className={styles.formInput}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder={t('modelBaseUrlPlaceholder')}
+            value={draft.baseUrl}
+            onChange={(event) => update({ baseUrl: event.target.value })}
+          />
+        </label>
+        <label className={styles.formField}>
+          <span className={styles.formLabel}>{t('modelApiKeyLabel')}</span>
+          <input
+            className={styles.formInput}
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder={t('apiKeyPlaceholder')}
+            value={draft.apiKey}
+            onChange={(event) => update({ apiKey: event.target.value })}
+          />
+        </label>
+        {/* provider 级默认：模型没声明时继承这里 */}
+        <div className={styles.capacityRow}>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelContextWindow')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              placeholder={t('modelCapacityPlaceholder')}
+              value={draft.defaultContextWindow === undefined ? '' : String(draft.defaultContextWindow)}
+              onChange={(event) =>
+                update({ defaultContextWindow: parseCapacity(event.target.value) })
+              }
+            />
+          </label>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelMaxTokens')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              placeholder={t('modelCapacityPlaceholder')}
+              value={draft.defaultMaxTokens === undefined ? '' : String(draft.defaultMaxTokens)}
+              onChange={(event) => update({ defaultMaxTokens: parseCapacity(event.target.value) })}
+            />
+          </label>
+        </div>
+        <span className={styles.formHint}>{t('providerDefaultHint')}</span>
+
+        {/* 模型列表：每个模型可单独覆盖能力 */}
+        <div className={styles.formField}>
+          <span className={styles.formLabel}>{t('providerModelsLabel')}</span>
+          <div className={styles.modelList}>
+            {draft.models.map((model, index) => (
+              <div key={index} className={styles.modelItem}>
+                <button
+                  type="button"
+                  className={styles.modelPick}
+                  onClick={() => setEditingModel(index)}
+                >
+                  <span className={styles.modelName}>{model.name || t('modelDefaultName')}</span>
+                  <span className={styles.modelMeta}>{model.id || '—'}</span>
+                  {model.inputModalities?.includes('image') ? (
+                    <span className={styles.modelCapability}>{t('modelInputImage')}</span>
+                  ) : null}
+                </button>
+                <div className={styles.modelActions}>
+                  <button
+                    type="button"
+                    className={styles.modelAction}
+                    onClick={() => setEditingModel(index)}
+                  >
+                    {t('modelEdit')}
+                  </button>
+                  {draft.models.length > 1 ? (
+                    <button
+                      type="button"
+                      className={clsx(styles.modelAction, styles.modelActionDanger)}
+                      onClick={() =>
+                        setDraft((value) => ({
+                          ...value,
+                          models: value.models.filter((_, position) => position !== index),
+                        }))
+                      }
+                    >
+                      {t('modelDelete')}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            className={styles.modelAdd}
+            onClick={() =>
+              setDraft((value) => ({
+                ...value,
+                models: [...value.models, { id: '', name: t('modelDefaultName') }],
+              }))
+            }
+          >
+            {t('modelAdd')}
+          </button>
+        </div>
+      </div>
+      <div className={styles.formActions}>
+        <Button variant="outlined" size="m" onClick={onDone}>
+          {t('modelCancel')}
+        </Button>
+        <Button
+          size="m"
+          onClick={() => {
+            const models = draft.models
+              .map((model) => ({ ...model, id: model.id.trim(), name: model.name.trim() }))
+              .filter((model) => model.id !== '')
+              .map((model) => ({
+                ...model,
+                name: model.name || model.id,
+                contextWindow: model.contextWindow,
+                maxTokens: model.maxTokens,
+                inputModalities: model.inputModalities,
+                reasoningEfforts: model.reasoningEfforts,
+              }))
+            // 一个模型都没有就不保存：空 provider 没法用
+            if (models.length === 0) {
+              return
+            }
+            saveProvider({
+              ...draft,
+              name: draft.name.trim() || t('providerDefaultName'),
+              baseUrl: draft.baseUrl.trim(),
+              apiKey: draft.apiKey.trim(),
+              models,
+            })
+            onDone()
+          }}
+        >
+          {t('modelSave')}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/** 单个模型编辑：标识、显示名，以及覆盖 provider 默认的能力 */
+const ModelForm = ({
+  model,
+  onCancel,
+  onSave,
+}: {
+  model: ModelProfile
+  onCancel: () => void
+  onSave: (model: ModelProfile) => void
+}) => {
+  const t = useTranslate()
+  const [draft, setDraft] = useState(model)
+  const update = (patch: Partial<ModelProfile>) => setDraft((value) => ({ ...value, ...patch }))
+  return (
+    <div className={styles.modelSection}>
+      <div className={styles.modelHeading}>
+        <div className={styles.label}>{t('modelSectionLabel')}</div>
+        <div className={styles.description}>{t('modelOverrideHint')}</div>
+      </div>
+      <div className={styles.form}>
+        <div className={styles.capacityRow}>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelIdLabel')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={t('modelIdPlaceholder')}
+              value={draft.id}
+              onChange={(event) => update({ id: event.target.value })}
+            />
+          </label>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelNameLabel')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={t('modelNamePlaceholder')}
+              value={draft.name}
+              onChange={(event) => update({ name: event.target.value })}
+            />
+          </label>
+        </div>
+        {/* 输入类型：不勾就继承 provider 默认 */}
+        <div className={styles.formField}>
+          <span className={styles.formLabel}>{t('modelInputTypes')}</span>
+          <div className={styles.modalityChoices}>
+            {(['text', 'image'] as const).map((modality) => {
+              const selected = draft.inputModalities ?? []
+              const checked = selected.includes(modality)
+              return (
+                <label key={modality} className={styles.modalityChoice}>
+                  <input
+                    type="checkbox"
+                    className={styles.modalityBox}
+                    checked={checked}
+                    onChange={(event) => {
+                      const next = (['text', 'image'] as const).filter((value) =>
+                        value === modality ? event.target.checked : selected.includes(value)
+                      )
+                      update({ inputModalities: next.length > 0 ? next : undefined })
+                    }}
+                  />
+                  <span>{t(modality === 'text' ? 'modelInputText' : 'modelInputImage')}</span>
+                </label>
+              )
+            })}
+          </div>
+          <span className={styles.formHint}>{t('modelInputTypesHint')}</span>
+        </div>
+        <div className={styles.capacityRow}>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelContextWindow')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              placeholder={t('modelCapacityInherit')}
+              value={draft.contextWindow === undefined ? '' : String(draft.contextWindow)}
+              onChange={(event) => update({ contextWindow: parseCapacity(event.target.value) })}
+            />
+          </label>
+          <label className={styles.formField}>
+            <span className={styles.formLabel}>{t('modelMaxTokens')}</span>
+            <input
+              className={styles.formInput}
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              placeholder={t('modelCapacityInherit')}
+              value={draft.maxTokens === undefined ? '' : String(draft.maxTokens)}
+              onChange={(event) => update({ maxTokens: parseCapacity(event.target.value) })}
+            />
+          </label>
+        </div>
+        {/* 推理强度：一个都不勾表示不支持深度思考 */}
+        <div className={styles.formField}>
+          <span className={styles.formLabel}>{t('modelReasoning')}</span>
+          <div className={styles.modalityChoices}>
+            {ALL_EFFORTS.map((level) => {
+              const selected = draft.reasoningEfforts ?? []
+              const checked = selected.includes(level)
+              return (
+                <label key={level} className={styles.modalityChoice}>
+                  <input
+                    type="checkbox"
+                    className={styles.modalityBox}
+                    checked={checked}
+                    onChange={(event) => {
+                      const next = ALL_EFFORTS.filter((value) =>
+                        value === level ? event.target.checked : selected.includes(value)
+                      )
+                      update({ reasoningEfforts: next.length > 0 ? next : undefined })
+                    }}
+                  />
+                  <span>{effortLabelOf(level)}</span>
+                </label>
+              )
+            })}
+          </div>
+          <span className={styles.formHint}>{t('modelReasoningHint')}</span>
+        </div>
+      </div>
+      <div className={styles.formActions}>
+        <Button variant="outlined" size="m" onClick={onCancel}>
+          {t('modelCancel')}
+        </Button>
+        <Button size="m" onClick={() => onSave(draft)}>
+          {t('modelDone')}
+        </Button>
+      </div>
+    </div>
+  )
+}
 
 const SettingCell = ({
   label,

@@ -255,6 +255,182 @@
   display: none;
 }
 
+/* 模型选择：输入框右下角的纯文字控件，右侧紧邻发送按钮。
+   规格取自网页版：透明底、13px、次要灰、28px 高、圆角 8px，悬停才浮出浅底。 */
+.modelAnchor {
+  display: inline-flex;
+}
+
+.modelTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  max-width: 240px;
+  height: 28px;
+  padding: 0 4px 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--dsw-alias-brand-primary);
+    outline-offset: 1px;
+  }
+
+  svg {
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+}
+
+/* 模型名过长时截断，effort 与箭头始终可见 */
+.modelName {
+  overflow: hidden;
+  min-width: 0;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 推理强度比模型名更淡 */
+.modelEffort {
+  flex-shrink: 0;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ---------- 两层菜单 ---------- */
+
+.modelMenu {
+  position: fixed;
+  z-index: 900;
+  box-sizing: border-box;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 4px;
+  border-radius: 12px;
+  background-color: var(--dsw-specific-menu);
+  box-shadow:
+    0 0 1px rgba(0, 0, 0, 0.2),
+    0 0 4px rgba(0, 0, 0, 0.02),
+    0 12px 32px rgba(0, 0, 0, 0.08);
+}
+
+/* 第一层的入口行：左标签 + 右当前值 + 右箭头 */
+.modelCell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  width: 100%;
+  height: 34px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+
+  &:focus-visible {
+    outline: none;
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+
+  svg {
+    flex-shrink: 0;
+    width: 12px;
+    height: 12px;
+    color: var(--dsw-alias-label-tertiary);
+  }
+}
+
+.modelCellLabel {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* 当前值靠右，比标签淡 */
+.modelCellValue {
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary);
+  text-align: right;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 第二层的列表项：名称 + 选中勾 */
+.modelOption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+
+  &:focus-visible {
+    outline: none;
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+
+  svg {
+    flex-shrink: 0;
+    color: var(--dsw-alias-brand-primary);
+  }
+}
+
+/* 菜单里按 provider 分组 */
+.modelGroup {
+  display: flex;
+  flex-direction: column;
+}
+
+.modelGroupLabel {
+  padding: 6px 8px 2px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.modelOptionName {
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .toggle {
   display: inline-flex;
   flex-shrink: 0;

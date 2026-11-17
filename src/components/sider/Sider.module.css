@@ -23,15 +23,70 @@
 }
 
 .appName {
+  display: flex;
+  align-items: center;
   min-width: 0;
   padding-left: 4px;
   overflow: hidden;
-  font-size: 20px;
-  line-height: 22px;
-  font-weight: 600;
-  white-space: nowrap;
-  text-overflow: ellipsis;
   color: var(--dsw-alias-brand-primary);
+}
+
+/* 官方品牌标识：固定 143×23 比例，窄屏按比例收 */
+.brand {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: 23px;
+  flex-shrink: 0;
+}
+
+.topActions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 36px;
+  margin-bottom: 4px;
+  padding: 0 10px;
+  border-radius: 100px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-tertiary);
+
+  &:focus-within {
+    border-color: var(--dsw-alias-brand-primary);
+  }
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 14px;
+
+  &::placeholder {
+    color: var(--dsw-alias-label-tertiary);
+  }
+}
+
+.empty {
+  padding: 16px 10px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+  text-align: center;
 }
 
 .newChat {

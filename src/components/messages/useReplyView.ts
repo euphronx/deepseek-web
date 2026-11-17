@@ -9,6 +9,7 @@ const sameSource = (a: Source, b: Source) =>
   a.publishedAt === b.publishedAt &&
   a.snippet === b.snippet &&
   a.siteIcon === b.siteIcon &&
+  a.imageUrl === b.imageUrl &&
   a.index === b.index
 
 /**

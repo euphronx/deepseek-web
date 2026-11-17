@@ -10,7 +10,8 @@ import type {
 } from 'mdast'
 import { CitationLink } from '../search/CitationLink.js'
 import { CodeBlock } from './CodeBlock.js'
-import { ImageAsLink, Link } from './Link.js'
+import { Link } from './Link.js'
+import { MarkdownImage } from './MarkdownImage.js'
 import { InlineMath, MathBlock } from './MathFormula.js'
 
 const Html = memo(function Html({ value }: { value: string }) {
@@ -118,7 +119,7 @@ const MarkdownPhrasingContentItem = memo(function MarkdownPhrasingContentItem({
         </em>
       )
     case 'image':
-      return <ImageAsLink node={node} />
+      return <MarkdownImage node={node} />
     case 'html':
       return <Html value={node.value} />
     case 'inlineCode':

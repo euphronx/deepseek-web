@@ -3,6 +3,7 @@ import type { TranslationMessage } from '../../i18n/index.js'
 import { createId } from '../../utils/id.js'
 import {
   cancelUpload,
+  filterByModality,
   isImage,
   resolveMimeType,
   uploadAttachment,
@@ -10,6 +11,7 @@ import {
   type UploadTask,
 } from '../attachments.js'
 import type { FileAttachment } from './types.js'
+import { activeAcceptsImage } from '../settings.js'
 
 export type DraftAttachment = {
   /** 本地标识，也是 IndexedDB 原件与上传任务的 key */
@@ -57,7 +59,7 @@ const upload = (attachment: DraftAttachment, apiKey: string) => {
   ).catch(() => {})
 }
 
-/** 整批校验通过后才创建预览和开始上传。 */
+/** 整批校验通过后才创建预览和开始上传 */
 export const addDraftFiles = (
   sessionId: string | null,
   files: File[],
@@ -70,7 +72,12 @@ export const addDraftFiles = (
   if (error) {
     return error
   }
-  const added = files.map((file): DraftAttachment => {
+  // 端点不支持图片时只丢图片，可读文件照常加上
+  const { kept, dropped } = filterByModality(files, activeAcceptsImage())
+  if (kept.length === 0) {
+    return { key: 'uploadUnsupportedImage' }
+  }
+  const added = kept.map((file): DraftAttachment => {
     const image = isImage(resolveMimeType(file))
     return {
       id: createId(),
@@ -81,7 +88,8 @@ export const addDraftFiles = (
   })
   updateDraft(sessionId, (draft) => ({ ...draft, attachments: [...draft.attachments, ...added] }))
   added.forEach((attachment) => upload(attachment, apiKey))
-  return null
+  // 部分图片被丢掉时提示一句，但文件已经加上了
+  return dropped > 0 ? { key: 'uploadImagesSkipped', params: { count: dropped } } : null
 }
 
 export const retryDraftAttachment = (
@@ -101,8 +109,16 @@ export const prepareDraftMessage = (draft: Draft, tasks: Record<string, UploadTa
   if (!text && draft.attachments.length === 0) {
     return null
   }
+  // 草稿里的图片可能是切到只支持文本的端点之前加的：
+  // 发送时丢掉这些图片，可读的文件照常带上，不连累整批。
+  const usable = activeAcceptsImage()
+    ? draft.attachments
+    : draft.attachments.filter((attachment) => !attachment.isImage)
+  if (!text && usable.length === 0) {
+    return null
+  }
   const files: (FileAttachment & { serverId: string; blob: Blob })[] = []
-  for (const attachment of draft.attachments) {
+  for (const attachment of usable) {
     const task = tasks[attachment.id]
     if (task?.status !== 'done' || !task.serverId) {
       return null

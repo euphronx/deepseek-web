@@ -61,7 +61,11 @@ export type FileErrorCode = 'fileIdMissing' | 'fileDataMissing' | 'invalidFileId
 const FILE_ERROR_PATTERNS: ReadonlyArray<readonly [FileErrorCode, RegExp]> = [
   ['fileIdMissing', /file_ids do not exist or are not created under your account/i],
   ['fileDataMissing', /file data not found for file_id/i],
-  ['invalidFileId', /\.source\.file_id: invalid file_id/i],
+  // OpenAI 兼容端的报错文案，例如 file_id not found / invalid file_id
+  [
+    'invalidFileId',
+    /(?:\.source\.file_id: invalid file_id|invalid file_id|file_id (?:is )?not found|file must have a file_id)/i,
+  ],
 ]
 
 /**

@@ -10,41 +10,51 @@ import { IconCheckOutline16, IconCopyOutline16 } from '../base/icons.js'
 import { showToast } from '../base/toastState.js'
 import { copyText } from '../../utils/clipboard.js'
 import { MermaidDiagram } from './MermaidDiagram.js'
+import { CanvasArtifact } from './CanvasArtifact.js'
 import styles from './CodeBlock.module.css'
 
-/** 代码块标题栏：左侧语言名，右侧复制 */
+/** 预览 / 代码 双视图切换的配置 */
+type ToggleConfig = {
+  /** 当前是否显示预览态 */
+  preview: boolean
+  /** 无障碍标签 */
+  label: string
+  previewLabel: string
+  codeLabel: string
+  onToggle: () => void
+}
+
+/** 代码块标题栏：左侧语言名或双视图切换，右侧复制 */
 const CodeInfoRow = ({
   code,
   infostring,
-  showDiagram,
-  onToggleDiagram,
+  toggle,
 }: {
   code: string
   infostring: string
-  showDiagram: boolean
-  onToggleDiagram?: () => void
+  toggle?: ToggleConfig
 }) => {
   const t = useTranslate()
   const [copied, setCopied] = useState(false)
   return (
     <div className={styles.container}>
-      {onToggleDiagram ? (
-        <div className="md-code-block-switch" aria-label={t('mermaidSwitchLabel')}>
+      {toggle ? (
+        <div className="md-code-block-switch" aria-label={toggle.label}>
           <button
             type="button"
             className={styles.button}
-            aria-pressed={showDiagram}
-            onClick={() => !showDiagram && onToggleDiagram()}
+            aria-pressed={toggle.preview}
+            onClick={() => !toggle.preview && toggle.onToggle()}
           >
-            {t('mermaidDiagram')}
+            {toggle.previewLabel}
           </button>
           <button
             type="button"
             className={styles.button}
-            aria-pressed={!showDiagram}
-            onClick={() => showDiagram && onToggleDiagram()}
+            aria-pressed={!toggle.preview}
+            onClick={() => toggle.preview && toggle.onToggle()}
           >
-            {t('mermaidCode')}
+            {toggle.codeLabel}
           </button>
         </div>
       ) : (
@@ -69,7 +79,10 @@ const CodeInfoRow = ({
   )
 }
 
-/** 代码块：语言包按需加载，不支持或尚未加载的语言按纯文本显示 */
+/**
+ * 代码块：语言包按需加载，不支持或尚未加载的语言按纯文本显示。
+ * 两个语言有专门的可视化视图：mermaid 画图、canvas 渲染 HTML。
+ */
 export const CodeBlock = memo(function CodeBlock({
   code,
   infostring,
@@ -79,18 +92,24 @@ export const CodeBlock = memo(function CodeBlock({
   infostring: string
   loading?: boolean
 }) {
-  const isMermaid = infostring.toLowerCase() === 'mermaid'
-  const [showDiagram, setShowDiagram] = useState(true)
+  const t = useTranslate()
+  const lang = infostring.toLowerCase()
+  const isMermaid = lang === 'mermaid'
+  /** ```canvas 代码块：把内容当 HTML 在沙箱 iframe 里渲染 */
+  const isCanvas = lang === 'canvas'
+  const hasPreview = isMermaid || isCanvas
+  const [showPreview, setShowPreview] = useState(true)
   // 语言包注册在全局 Prism 上，每次渲染直接判断；加载完成后触发一次重渲染
   const rerender = useReducer((n: number) => n + 1, 0)[1]
-  const lang = getHighlightLang(infostring)
-  const loaded = lang !== null && isHighlightLoaded(lang)
+  // canvas 的内容是 HTML，代码视图按 markup 高亮
+  const highlightLang = getHighlightLang(isCanvas ? 'html' : infostring)
+  const loaded = highlightLang !== null && isHighlightLoaded(highlightLang)
   useEffect(() => {
-    if (lang === null || loaded) {
+    if (highlightLang === null || loaded) {
       return
     }
     let unmounted = false
-    loadHighlight(lang).then(() => {
+    loadHighlight(highlightLang).then(() => {
       if (!unmounted) {
         rerender()
       }
@@ -98,23 +117,31 @@ export const CodeBlock = memo(function CodeBlock({
     return () => {
       unmounted = true
     }
-  }, [lang, loaded, rerender])
+  }, [highlightLang, loaded, rerender])
   const renderedHtml = useMemo(() => {
-    const name = lang !== null && loaded ? lang : 'plaintext'
+    const name = highlightLang !== null && loaded ? highlightLang : 'plaintext'
     return Prism.highlight(code, Prism.languages[name], name)
-  }, [code, lang, loaded])
+  }, [code, highlightLang, loaded])
+  const toggle: ToggleConfig | undefined = !hasPreview
+    ? undefined
+    : {
+        preview: showPreview,
+        label: t(isCanvas ? 'canvasSwitchLabel' : 'mermaidSwitchLabel'),
+        previewLabel: t(isCanvas ? 'canvasPreview' : 'mermaidDiagram'),
+        codeLabel: t(isCanvas ? 'canvasCode' : 'mermaidCode'),
+        onToggle: () => setShowPreview((show) => !show),
+      }
   return (
     <div className="md-code-block">
       <div className="md-code-block-banner">
-        <CodeInfoRow
-          code={code}
-          infostring={infostring}
-          showDiagram={showDiagram}
-          onToggleDiagram={isMermaid ? () => setShowDiagram((show) => !show) : undefined}
-        />
+        <CodeInfoRow code={code} infostring={infostring} toggle={toggle} />
       </div>
-      {isMermaid && showDiagram ? (
-        <MermaidDiagram code={code} loading={loading} />
+      {hasPreview && showPreview ? (
+        isMermaid ? (
+          <MermaidDiagram code={code} loading={loading} />
+        ) : (
+          <CanvasArtifact code={code} loading={loading} />
+        )
       ) : (
         <pre dangerouslySetInnerHTML={{ __html: renderedHtml }}></pre>
       )}

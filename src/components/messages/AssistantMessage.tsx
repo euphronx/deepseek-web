@@ -1,12 +1,19 @@
 import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
 import { memo } from 'react'
-import { IconRefreshOutline16, IconWarningOutline16 } from '../base/icons.js'
+import {
+  IconRefreshOutline16,
+  IconShareOutline16,
+  IconWarningOutline16,
+} from '../base/icons.js'
 import { describeReply } from '../../services/chat/describe.js'
+import { isDeepSeekProvider, useSettings } from '../../services/settings.js'
 import { canContinueReply } from '../../services/chat/reply.js'
 import { continueReply, regenerateReply } from '../../services/chat/store.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import type { AssistantMessage as AssistantMessageType } from '../../services/chat/types.js'
+import { copyText as writeClipboard } from '../../utils/clipboard.js'
+import { showToast } from '../base/toastState.js'
 import { openSettings } from '../settings/settingsDialogState.js'
 import { IconButton } from '../base/IconButton.js'
 import { Button } from '../base/Button.js'
@@ -46,6 +53,12 @@ export const AssistantMessage = memo(function AssistantMessage({
   const t = useTranslate()
   const view = useReplyView(message, streaming)
   const panelEntry = useSearchPanel((state) => state.entry)
+  /** 续写依赖 DeepSeek 的 beta 端点，第三方 provider 不显示这个入口 */
+  const supportsExtensions = useSettings((state) => {
+    const provider =
+      state.providers.find((item) => item.id === state.activeProviderId) ?? state.providers[0]
+    return provider ? isDeepSeekProvider(provider) : true
+  })
   const notice = streaming ? null : describeReply(message)
   // 安全拒绝：已下发的思考与正文按协议丢弃，只显示模板答复。
   const refused = message.stopReason === 'refusal'
@@ -143,9 +156,6 @@ export const AssistantMessage = memo(function AssistantMessage({
           <BranchSwitcher versions={versions} disabled={busy} onSelect={onSelectVersion} />
           <div className={clsx(styles.actions, isLast && styles.alwaysShow)}>
             {copyText ? <CopyButton text={copyText} /> : null}
-            {responseText && !refused ? (
-              <ReadAloudButton messageId={message.id} text={responseText} />
-            ) : null}
             <IconButton
               icon={<IconRefreshOutline16 />}
               tooltip={t('regenerate')}
@@ -156,8 +166,25 @@ export const AssistantMessage = memo(function AssistantMessage({
                 regenerateReply(sessionId, message.id)
               }}
             />
+            {responseText && !refused ? (
+              <>
+                <ReadAloudButton messageId={message.id} text={responseText} />
+                <IconButton
+                  icon={<IconShareOutline16 />}
+                  tooltip={t('share')}
+                  tooltipPlacement="bottom"
+                  onClick={async () => {
+                    if (await writeClipboard(responseText)) {
+                      showToast({ key: 'copied' })
+                    } else {
+                      showToast({ key: 'copyFailed' })
+                    }
+                  }}
+                />
+              </>
+            ) : null}
           </div>
-          {isLast && canContinueReply(message) ? (
+          {isLast && supportsExtensions && canContinueReply(message) ? (
             <Button
               variant="outlined"
               size="s"

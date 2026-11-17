@@ -16,6 +16,18 @@ declare const styles: {
   readonly "collapsedToggles": string;
   readonly "toggleLabel": string;
   readonly "toggle": string;
+  readonly "modelAnchor": string;
+  readonly "modelTrigger": string;
+  readonly "modelName": string;
+  readonly "modelEffort": string;
+  readonly "modelMenu": string;
+  readonly "modelCell": string;
+  readonly "modelCellLabel": string;
+  readonly "modelCellValue": string;
+  readonly "modelOption": string;
+  readonly "modelOptionName": string;
+  readonly "modelGroup": string;
+  readonly "modelGroupLabel": string;
   readonly "selected": string;
   readonly "right": string;
   readonly "sendButton": string;

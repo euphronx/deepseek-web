@@ -1,12 +1,19 @@
 import clsx from 'clsx'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
-import { IconPanelLeftOutline16, IconSettingsOutline16, NewChatIcon } from '../base/icons.js'
+import {
+  IconPanelLeftOutline16,
+  IconSettingsOutline16,
+  IconSidebarSearchOutline16,
+  NewChatIcon,
+} from '../base/icons.js'
 import { setSiderCollapsed } from '../../services/settings.js'
-import { groupSessions } from '../../services/chat/sessionGroups.js'
+import * as db from '../../services/chat/db.js'
+import { filterSessions, groupSessions } from '../../services/chat/sessionGroups.js'
 import { newChat, removeSession, useChatStore } from '../../services/chat/store.js'
 import type { SessionSummary } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
+import { BrandLogo } from '../base/BrandLogo.js'
 import { IconButton } from '../base/IconButton.js'
 import { Modal } from '../base/Modal.js'
 import { showToast } from '../base/toastState.js'
@@ -15,15 +22,48 @@ import { closeMobileSider, useMobileSider } from './mobileSiderState.js'
 import { SessionItem } from './SessionItem.js'
 import styles from './Sider.module.css'
 
-/** 展开的侧边栏：名称与收起按钮、开启新对话、按时间分组的会话列表、底部设置；移动端放在抽屉里，收起按钮关闭抽屉 */
+/** 展开的侧边栏：名称与搜索/收起按钮、开启新对话、按时间分组的会话列表、底部设置；移动端放在抽屉里 */
 export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   const t = useTranslate()
   const sessions = useChatStore((state) => state.sessions)
   const activeId = useChatStore((state) => state.activeId)
   const [now, setNow] = useState(Date.now)
-  const groups = useMemo(() => groupSessions(sessions, now, t), [sessions, now, t])
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [keyword, setKeyword] = useState('')
+  const [bodyIndex, setBodyIndex] = useState<ReadonlyMap<string, string>>(new Map())
+  const searchRef = useRef<HTMLInputElement>(null)
+  const visible = useMemo(
+    () => filterSessions(sessions, keyword, bodyIndex),
+    [sessions, keyword, bodyIndex]
+  )
+  const groups = useMemo(() => groupSessions(visible, now, t), [visible, now, t])
   const [deleting, setDeleting] = useState<SessionSummary | null>(null)
   const [deletePending, setDeletePending] = useState(false)
+
+  // 第一次打开搜索时才读取全部会话正文：消息平时只在打开会话时载入内存
+  useEffect(() => {
+    if (!searchOpen) {
+      return
+    }
+    let cancelled = false
+    void db.loadSearchIndex().then((entries) => {
+      if (!cancelled) {
+        setBodyIndex(new Map(entries.map((entry) => [entry.id, entry.text])))
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [searchOpen])
+
+  // 打开搜索时聚焦输入框；关闭时清空关键词，回到完整列表
+  useEffect(() => {
+    if (searchOpen) {
+      searchRef.current?.focus()
+    } else {
+      setKeyword('')
+    }
+  }, [searchOpen])
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>
@@ -52,15 +92,45 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   return (
     <div className={clsx(styles.sider, mobile && styles.mobile)}>
       <div className={styles.top}>
-        <div className={styles.appName}>{t('appName')}</div>
-        <IconButton
-          size="m"
-          icon={<IconPanelLeftOutline16 />}
-          tooltip={t('collapseSiderbarButton')}
-          tooltipPlacement="bottom"
-          onClick={() => (mobile ? closeMobileSider() : setSiderCollapsed(true))}
-        />
+        <div className={styles.appName}>
+          <BrandLogo className={styles.brand} role="img" aria-label={t('appName')} />
+        </div>
+        <div className={styles.topActions}>
+          <IconButton
+            size="m"
+            icon={<IconSidebarSearchOutline16 />}
+            tooltip={t('sessionSearchPlaceholder')}
+            tooltipPlacement="bottom"
+            aria-expanded={searchOpen}
+            onClick={() => setSearchOpen((open) => !open)}
+          />
+          <IconButton
+            size="m"
+            icon={<IconPanelLeftOutline16 />}
+            tooltip={t('collapseSiderbarButton')}
+            tooltipPlacement="bottom"
+            onClick={() => (mobile ? closeMobileSider() : setSiderCollapsed(true))}
+          />
+        </div>
       </div>
+      {searchOpen ? (
+        <div className={styles.search}>
+          <IconSidebarSearchOutline16 />
+          <input
+            ref={searchRef}
+            className={styles.searchInput}
+            value={keyword}
+            placeholder={t('sessionSearchPlaceholder')}
+            onChange={(event) => setKeyword(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                setSearchOpen(false)
+              }
+            }}
+          />
+        </div>
+      ) : null}
       <button
         type="button"
         className={styles.newChat}
@@ -76,6 +146,9 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
       </button>
       <div className={styles.listWrap}>
         <div className={styles.list}>
+          {groups.length === 0 && keyword ? (
+            <div className={styles.empty}>{t('sessionSearchEmpty')}</div>
+          ) : null}
           {groups.map((group) => (
             <div key={group.key} className={styles.section}>
               <div className={styles.sectionHeader}>{group.label}</div>

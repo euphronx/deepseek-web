@@ -1,10 +1,19 @@
 import { create } from 'zustand'
 import { createId } from '../../utils/id.js'
-import { ApiError, streamMessage } from '../api/client.js'
-import type { ChatModel, CreateMessageRequest } from '../api/types.js'
+import { ApiError, streamChat } from '../api/client.js'
+import type { ChatRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
-import { useSettings } from '../settings.js'
+import {
+  activeSupportsExtensions,
+  getActiveModel,
+  getActiveModelProfile,
+  getActiveProvider,
+  getApiKey,
+  isDeepSeekProvider,
+  resolveEffort,
+  useSettings,
+} from '../settings.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import {
@@ -18,6 +27,7 @@ import { createLatestReminder } from './latestReminder.js'
 import {
   applyEvent,
   canContinueReply,
+  createStreamState,
   getContextRounds,
   settleReply,
   toRequestMessages,
@@ -32,13 +42,9 @@ import {
   type UserMessage,
 } from './types.js'
 
-/** deepseek-flash 同时支持深度思考与图片输入 */
-const MODEL: ChatModel = 'deepseek-flash'
-/** 所有生成请求统一携带的助手身份说明 */
-const SYSTEM_PROMPT = '该助手为DeepSeek，由深度求索公司创造。'
 /** 保留最近打开的详情；当前会话、生成中及尚未成功保存的会话不淘汰。 */
 const SESSION_CACHE_LIMIT = 5
-/** 安全审核固定开启，所有请求都走扩展模式 */
+/** 安全审核固定开启 */
 const SAFETY_CHECK = { level: 'high' } as const
 /** 服务端判定 file_id 失效后，重新补传并重发的最多次数（不含首次请求） */
 const FILE_RETRY_LIMIT = 2
@@ -46,12 +52,10 @@ const FILE_RETRY_LIMIT = 2
 const FILE_RETRY_BASE_DELAY = 1000
 
 /** 阅读链接始终开启，智能搜索开关控制是否另行声明搜索工具（含边想边搜）。 */
-const serverTools = (search: boolean): CreateMessageRequest['tools'] => {
-  const tools: CreateMessageRequest['tools'] = [
-    { type: 'deepseek_read_url', name: 'deepseek_read_url' },
-  ]
+const serverTools = (search: boolean): ChatRequest['tools'] => {
+  const tools: NonNullable<ChatRequest['tools']> = [{ type: 'deepseek_read_url' }]
   if (search) {
-    tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' })
+    tools.push({ type: 'deepseek_web_search' })
   }
   return tools
 }
@@ -103,7 +107,10 @@ const getStreamController = (id: string) => {
 }
 
 const sameSummary = (a: SessionSummary, b: SessionSummary) =>
-  a.title === b.title && a.createdAt === b.createdAt && a.updatedAt === b.updatedAt
+  a.title === b.title &&
+  a.createdAt === b.createdAt &&
+  a.updatedAt === b.updatedAt &&
+  Boolean(a.pinned) === Boolean(b.pinned)
 
 const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
@@ -260,7 +267,7 @@ const createReply = (): AssistantMessage => {
     id: createId(),
     role: 'assistant',
     createdAt: Date.now(),
-    model: MODEL,
+    model: getActiveModel(),
     thinking,
     search,
     prefix: true,
@@ -478,6 +485,36 @@ export const renameSession = (id: string, title: string) => {
 }
 
 /**
+ * 切换会话置顶。置顶与时间分组并列：置顶的会话单独成组排在最前。
+ * 只改列表元数据，不触碰消息，也不影响 updatedAt。
+ */
+export const togglePinSession = (id: string) => {
+  if (get().importingHistory || deletingSessions.has(id)) {
+    return
+  }
+  if (getSession(id)) {
+    // 取消置顶时删掉字段，避免持久化出 pinned: false
+    updateSession(id, (session) => ({
+      ...session,
+      pinned: session.pinned ? undefined : true,
+    }))
+    persist(id)
+    return
+  }
+  const current = get().sessions.find((session) => session.id === id)
+  if (!current) {
+    return
+  }
+  const pinned = !current.pinned
+  set((state) => ({
+    sessions: state.sessions.map((session) =>
+      session.id === id ? { ...session, pinned: pinned ? true : undefined } : session
+    ),
+  }))
+  void db.pinSession(id, pinned).catch(db.reportStorageError('pin session'))
+}
+
+/**
  * 删除会话；本地原件仅在没有其他会话引用时清理。远端文件不删：导入、编辑、重新生成都会复用同一个附件，
  * 同一服务端文件可能被多个会话引用，不维护引用计数。
  */
@@ -690,6 +727,11 @@ export const continueReply = (sessionId: string, messageId: string) => {
   if (get().importingHistory || deletingSessions.has(sessionId)) {
     return
   }
+  // 续写依赖 DeepSeek 的 beta 端点与 prefix 语义，第三方兼容端点没有这套协议；
+  // 界面上也不会给这种端点显示续写按钮，这里只是兜底。
+  if (!activeSupportsExtensions()) {
+    return
+  }
   const session = getSession(sessionId)
   if (!session || getStreamController(sessionId)) {
     return
@@ -709,7 +751,7 @@ export const continueReply = (sessionId: string, messageId: string) => {
   const reply: AssistantMessage = {
     ...previous,
     // 未记录请求配置的回复，续写时使用默认模型和当前开关。
-    model: previous.model ?? MODEL,
+    model: previous.model ?? getActiveModel(),
     thinking: previous.thinking ?? thinking,
     search: previous.search ?? search,
     status: 'pending',
@@ -818,7 +860,7 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   // 服务端判定 file_id 失效时会清掉会话里的 serverId，先用最新消息替换请求快照，
   // 否则快照里仍是旧 id，补传会直接复用它。
   request = refreshRequest(sessionId, request)
-  const apiKey = useSettings.getState().apiKey ?? ''
+  const apiKey = getApiKey()
   const serverIds = new Map<string, string>()
   // 停止生成立即生效；上传本身不取消（输入框与其他消息可能共用同一任务），完成后照常写回 serverId
   const aborted = new Promise<never>((_, reject) => {
@@ -961,6 +1003,14 @@ const waitForRetry = (attempt: number, signal: AbortSignal) =>
  */
 const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request) => {
   const controller = new AbortController()
+  // 本轮固定使用开始时的 provider / 模型与推理强度，中途切换设置不影响已发出的这一轮
+  const provider = getActiveProvider()
+  const modelProfile = getActiveModelProfile()
+  const deepseek = isDeepSeekProvider(provider)
+  // 收敛到该模型真正支持的档位；不支持深度思考时是 undefined，不携带该参数
+  const effort = resolveEffort(provider, modelProfile, useSettings.getState().effort)
+  const maxTokens = modelProfile.maxTokens ?? provider.defaultMaxTokens
+  const contextWindow = modelProfile.contextWindow ?? provider.defaultContextWindow
   if (!getSession(sessionId)?.title) {
     titleRequests.add(controller)
   }
@@ -994,42 +1044,74 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           prepared.question,
           prepared.prefix,
           initial.thinking ?? false,
-          latestReminder
+          latestReminder,
+          deepseek,
+          contextWindow
         )
-        const events = streamMessage(
-          useSettings.getState().apiKey ?? '',
+        const events = streamChat(
+          getApiKey(),
           {
-            model: initial.model ?? MODEL,
-            system: SYSTEM_PROMPT,
+            model: initial.model ?? getActiveModel(),
             messages,
             thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
-            safety_check: SAFETY_CHECK,
-            tools: serverTools(initial.search ?? false),
-            ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+            // 推理强度只在开启思考且端点确实支持时携带
+            ...(initial.thinking && effort !== undefined ? { reasoning_effort: effort } : {}),
+            // 端点上声明了输出上限才带，否则交给服务端默认值
+            ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+            // 下面这些是 DeepSeek 扩展，第三方端点不认识，按端点区分
+            ...(deepseek
+              ? {
+                  safety_check: SAFETY_CHECK,
+                  tools: serverTools(initial.search ?? false),
+                  ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+                }
+              : {}),
           },
-          controller.signal
+          controller.signal,
+          // 末尾 assistant 带 prefix 时服务端只接受 beta 端点
+          Boolean(prepared.prefix?.prefix)
         )
-        const blockIndexes = new Map<number, number>()
-        for await (const event of events) {
-          receivedContent ||= event.type === 'content_block_start'
+        const streamState = createStreamState()
+        /** 本轮请求是否带 title，用于诊断 */
+        const requestedTitle = titleRequests.has(controller)
+        /** 本轮是否真的收到过思考内容；用于诊断「开了深度思考却没有思考」 */
+        let receivedThinking = false
+        for await (const chunk of events) {
+          const reasoning = chunk.choices.some((choice) =>
+            Boolean(choice.delta.reasoning_content)
+          )
+          receivedThinking ||= reasoning
+          receivedContent ||=
+            reasoning ||
+            chunk.choices.some(
+              (choice) => Boolean(choice.delta.content) || Boolean(choice.server_tool_event)
+            )
+          reply = applyEvent(reply, chunk, Date.now(), streamState)
           if (
-            event.type === 'message_delta' &&
-            (event.delta.stop_reason === 'end_turn' || event.delta.stop_reason === 'max_tokens') &&
-            event.delta.title?.trim() &&
+            streamState.title?.trim() &&
             titleRequests.has(controller) &&
             !controller.signal.aborted &&
             !get().importingHistory
           ) {
-            const title = event.delta.title.trim()
+            const title = streamState.title.trim()
             updateSession(sessionId, (session) => (session.title ? session : { ...session, title }))
             titleRequests.delete(controller)
           }
-          reply = applyEvent(reply, event, Date.now(), blockIndexes)
           if (document.visibilityState === 'hidden') {
             flush()
           } else {
             frame ||= requestAnimationFrame(flush)
           }
+        }
+        // 开了深度思考但一个 reasoning 片段都没收到：不是前端丢的，是服务端没下发。
+        // 首次请求额外带 title；若怀疑与标题生成有关，可在同一会话再发一条对比。
+        if (initial.thinking && !receivedThinking) {
+          // eslint-disable-next-line no-console
+          console.warn('[chat] thinking enabled but no reasoning_content received', {
+            stopReason: reply.stopReason,
+            requestedTitle,
+            usage: reply.usage,
+          })
         }
         reply = settleReply(reply, 'done', Date.now())
         break
@@ -1061,7 +1143,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           continue
         }
         if (error instanceof ApiError && error.kind === 'interrupted' && reply.stopReason) {
-          // 已收到 message_delta 的结束原因，只是缺了结尾的 message_stop
+          // 已收到 finish_reason，只是缺了结尾的 [DONE]
           reply = settleReply(reply, 'done', Date.now())
         } else if (error instanceof ApiError) {
           reply = settleReply(reply, 'error', Date.now(), {

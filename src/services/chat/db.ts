@@ -3,6 +3,12 @@ import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
 const DB_VERSION = 11
+/** 当前库名 */
+const DB_NAME = 'chat'
+/** 旧库名，仅用于一次性搬迁 */
+const LEGACY_DB_NAME = 'chat-demo'
+/** 需要搬迁的存储，顺序无关 */
+const STORES = ['sessions', 'sessionSummaries', 'files', 'sessionsStaging', 'filesStaging'] as const
 
 /** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
 export type StoredFile = {
@@ -52,9 +58,52 @@ const abortTransaction = (tx: { abort(): void }) => {
   }
 }
 
-// 每个操作拿到连接后立即创建事务；IndexedDB 按创建顺序执行范围重叠的事务，读取总能看到之前发起的写入。
-const getDB = () =>
-  (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
+/** 判断浏览器是否还留着旧库；不支持枚举数据库时当作没有 */
+const hasLegacyDatabase = async (): Promise<boolean> => {
+  if (typeof indexedDB.databases !== 'function') {
+    return false
+  }
+  try {
+    const databases = await indexedDB.databases()
+    return databases.some((info) => info.name === LEGACY_DB_NAME)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 把旧库的全部内容搬进新库，成功后删掉旧库。
+ *
+ * 只在旧库存在、且新库还没有数据时执行：新库已有会话说明用户已经在新版本里
+ * 用过，这时旧库只是残留，直接删掉即可，免得每次启动都扫一遍。
+ */
+const migrateLegacyDatabase = async (target: IDBPDatabase<ChatDB>) => {
+  if (!(await hasLegacyDatabase())) {
+    return
+  }
+  const legacy = await openDB(LEGACY_DB_NAME)
+  try {
+    const existing = await target.count('sessions')
+    if (existing === 0) {
+      for (const store of STORES) {
+        if (!legacy.objectStoreNames.contains(store)) {
+          continue
+        }
+        const rows = await legacy.getAll(store)
+        for (const row of rows) {
+          await target.put(store, row)
+        }
+      }
+    }
+  } finally {
+    legacy.close()
+    indexedDB.deleteDatabase(LEGACY_DB_NAME)
+  }
+}
+
+/** 打开当前库，必要时先把旧库搬过来 */
+const openDatabase = async (): Promise<IDBPDatabase<ChatDB>> => {
+  const database = await openDB<ChatDB>(DB_NAME, DB_VERSION, {
     upgrade(db, _oldVersion, _newVersion, tx) {
       // 初始化当前格式需要的存储与索引，不迁移旧消息。
       for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
@@ -69,7 +118,14 @@ const getDB = () =>
         summaries.createIndex('fileIds', 'fileIds', { multiEntry: true })
       }
     },
-  }).catch((error: unknown) => {
+  })
+  await migrateLegacyDatabase(database)
+  return database
+}
+
+// 每个操作拿到连接后立即创建事务；IndexedDB 按创建顺序执行范围重叠的事务，读取总能看到之前发起的写入。
+const getDB = () =>
+  (dbPromise ??= openDatabase().catch((error: unknown) => {
     // 打开失败后允许界面重试，避免一直复用已拒绝的 Promise。
     dbPromise = null
     throw error
@@ -77,6 +133,31 @@ const getDB = () =>
 
 export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
   (await (await getDB()).getAll('sessionSummaries')).map(toSessionSummary)
+
+/**
+ * 全部会话的检索文本：标题 + 每条消息的正文与思考。
+ * 搜索要覆盖对话内容，而消息只在会话打开时才载入内存，所以这里一次性读出。
+ */
+export const loadSearchIndex = async (): Promise<{ id: string; text: string }[]> => {
+  const sessions = await (await getDB()).getAll('sessions')
+  return sessions.map((session) => {
+    const parts: string[] = [session.title]
+    for (const message of session.messages) {
+      if (message.role === 'user') {
+        parts.push(message.content, ...message.files.map((file) => file.name))
+        continue
+      }
+      for (const block of message.blocks) {
+        if (block.type === 'text') {
+          parts.push(block.text)
+        } else if (block.type === 'thinking') {
+          parts.push(block.thinking)
+        }
+      }
+    }
+    return { id: session.id, text: parts.join('\n').toLowerCase() }
+  })
+}
 
 export const loadSession = async (id: string): Promise<Session | undefined> =>
   (await getDB()).get('sessions', id)
@@ -111,6 +192,32 @@ export const renameSession = async (id: string, title: string): Promise<void> =>
         const session = await sessions.get(id)
         if (session) {
           session.title = title
+          await sessions.put(session)
+          await tx.objectStore('sessionSummaries').put(storedSummary(session))
+        }
+      } catch (error) {
+        abortTransaction(tx)
+        throw error
+      }
+    })(),
+    tx.done,
+  ])
+}
+
+/** 未打开的会话也可置顶，只读取该会话，原子更新详情和列表。 */
+export const pinSession = async (id: string, pinned: boolean): Promise<void> => {
+  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
+  await Promise.all([
+    (async () => {
+      try {
+        const sessions = tx.objectStore('sessions')
+        const session = await sessions.get(id)
+        if (session) {
+          if (pinned) {
+            session.pinned = true
+          } else {
+            delete session.pinned
+          }
           await sessions.put(session)
           await tx.objectStore('sessionSummaries').put(storedSummary(session))
         }

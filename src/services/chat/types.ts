@@ -1,7 +1,6 @@
 import type { TranslationMessage } from '../../i18n/index.js'
 import type { ApiErrorKind } from '../api/client.js'
 import type {
-  ChatModel,
   MessageUsage,
   ServerToolBlock,
   StopDetails,
@@ -40,20 +39,20 @@ export type UserMessage = MessageBranch & {
   createdAt: number
 }
 
-/** 思考块：thinking_delta 累积，签名随 signature_delta 到达；历史轮次的思考服务端会丢弃，不回传 */
+/** 思考块：reasoning_content 累积；历史轮次的思考服务端会丢弃，不回传 */
 export type ThinkingPart = {
   type: 'thinking'
   thinking: string
   signature?: string
-  /** content_block_start 的时间；没有事件时间的历史块缺省 */
+  /** 思考开始累积的时间；没有事件时间的历史块缺省 */
   startedAt?: number
-  /** content_block_stop（或回复结束）的时间 */
+  /** 该步思考结束（或回复结束）的时间 */
   endedAt?: number
   /** 仅有耗时、没有事件时间时保存秒数。 */
   elapsedSeconds?: number
 }
 
-/** 文本块：text_delta 累积，citations_delta 追加引用 */
+/** 文本块：正文累积，引用由末块给出的码点偏移切分后追加 */
 export type TextPart = {
   type: 'text'
   text: string
@@ -67,7 +66,7 @@ export type ReplyBlock = ThinkingPart | TextPart | ServerToolBlock
 
 /**
  * pending：已发出请求，还没收到事件；streaming：正在接收；
- * done：收到 message_stop；stopped：用户停止或页面关闭；error：请求或流出错
+ * done：收到 finish_reason 与 [DONE]；stopped：用户停止或页面关闭；error：请求或流出错
  */
 export type ReplyStatus = 'pending' | 'streaming' | 'done' | 'stopped' | 'error'
 
@@ -75,8 +74,8 @@ export type AssistantMessage = MessageBranch & {
   id: string
   role: 'assistant'
   createdAt: number
-  /** 未记录模型时为 null，续写使用当前默认模型。 */
-  model: ChatModel | null
+  /** 生成这条回答所用模型的标识；未记录时为 null，续写使用当前模型。 */
+  model: string | null
   /** 请求时是否开启深度思考 */
   thinking?: boolean
   /** 请求时是否声明 deepseek_web_search；关闭时仍声明 deepseek_read_url */
@@ -114,10 +113,14 @@ export type Session = {
   messages: Message[]
   /** undefined 表示线性消息列表；null 表示空会话。 */
   rootMessageId?: string | null
+  /** 置顶的会话排在列表最前，与时间分组并列。 */
+  pinned?: boolean
 }
 
 /** 会话列表元数据；消息只在打开会话时加载。 */
-export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'>
+export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'> & {
+  pinned?: boolean
+}
 
 /** 显式提取字段，避免将完整会话的消息带进列表。 */
 export const toSessionSummary = (session: SessionSummary): SessionSummary => ({
@@ -125,4 +128,5 @@ export const toSessionSummary = (session: SessionSummary): SessionSummary => ({
   title: session.title,
   createdAt: session.createdAt,
   updatedAt: session.updatedAt,
+  ...(session.pinned ? { pinned: true } : {}),
 })

@@ -62,7 +62,7 @@ git fetch upstream
 git merge upstream/main
 ```
 
-Chat uses `deepseek-flash` by default through Anthropic-compatible Messages / Files APIs. Speech features use ASR / TTS endpoints. Requests include extensions for search, link reading, titles, and `latest_reminder`, so the configured service must support the corresponding capabilities. Supported attachment formats are determined by server-side validation.
+Chat uses `deepseek-flash` by default through OpenAI-compatible Chat Completions and Files APIs; continuation requests use the beta endpoint. Speech features use the ASR / TTS endpoints of the same origin. Requests include extensions for search, link reading, titles, and `latest_reminder`, so the configured service must support the corresponding capabilities. Replies may cite images with `![alt](url)`; only `http(s)` and inline `data:image/...` sources are rendered. Supported attachment formats are determined by server-side validation.
 
 ```text
 src/

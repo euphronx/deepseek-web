@@ -1,20 +1,11 @@
 import { translate, type TranslationMessage } from '../../i18n/index.js'
-import { readMessageEvent } from './parseEvent.js'
+import { getApiBaseUrl } from '../settings.js'
+import { readChatChunk } from './parseChunk.js'
 import { readServerSentEvents } from './sse.js'
-import type {
-  ApiErrorBody,
-  CreateMessageRequest,
-  FileObject,
-  FilePurpose,
-  MessageStreamEvent,
-} from './types.js'
+import type { ApiErrorBody, ChatChunk, ChatRequest, FileObject, FilePurpose } from './types.js'
 
-/** 构建期 API 地址，默认 https://api.deepseek.com；本地开发支持开发服务器代理 */
+/** 构建期注入的默认 API 地址；实际请求地址由设置里的端点决定 */
 export const API_ORIGIN = __API_ORIGIN__
-/** Anthropic 兼容接口的前缀 */
-const ANTHROPIC_BASE_URL = `${API_ORIGIN}/anthropic/v1`
-/** 引用 Files API 上传的图片、调用 Anthropic 兼容 Files API 时必须携带 */
-const FILES_BETA = 'files-api-2025-04-14'
 
 export type ApiErrorKind =
   /** 非 2xx 响应 */
@@ -23,7 +14,7 @@ export type ApiErrorKind =
   | 'stream'
   /** 请求没有到达服务端（断网、跨域被拦截等） */
   | 'network'
-  /** 流在 message_stop 之前结束 */
+  /** 流在 finish_reason 之前结束 */
   | 'interrupted'
   /** 响应不符合协议（如非 SSE 响应） */
   | 'protocol'
@@ -82,74 +73,67 @@ export const request = async (url: string, init: RequestInit): Promise<Response>
   return response
 }
 
-const anthropicHeaders = (apiKey: string, beta: boolean): Record<string, string> => ({
-  // DeepSeek 兼容接口的鉴权方式，也可使用 Authorization: Bearer。
-  'x-api-key': apiKey,
-  // Files API 和通过 file_id 引用图片时必传；纯文本聊天无需携带。
-  ...(beta ? { 'anthropic-beta': FILES_BETA } : {}),
+/** 对话与文件接口统一使用 Bearer 鉴权 */
+const authHeaders = (apiKey: string): Record<string, string> => ({
+  Authorization: `Bearer ${apiKey}`,
 })
 
 /** 用 GET /models 校验 API Key（不产生费用） */
 export const verifyApiKey = async (apiKey: string, signal?: AbortSignal): Promise<void> => {
-  await request(`${API_ORIGIN}/models`, {
+  await request(`${getApiBaseUrl()}/models`, {
     method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: authHeaders(apiKey),
     signal,
   })
 }
 
 /**
- * POST /anthropic/v1/files 上传附件（不设过期时间，会话里的历史附件一直可用）。
- * purpose 为 null 时不传该字段（图片）；purpose 必须排在 file 之前。
+ * POST /files 上传附件（不设过期时间，会话里的历史附件一直可用）。
+ * purpose 必填，且必须排在 file 之前；顺序颠倒服务端会拒绝。
  */
 export const uploadFile = async (
   apiKey: string,
   file: File,
-  purpose: FilePurpose | null,
+  purpose: FilePurpose,
   signal?: AbortSignal
 ): Promise<FileObject> => {
   const form = new FormData()
-  if (purpose) {
-    form.append('purpose', purpose)
-  }
+  form.append('purpose', purpose)
   form.append('file', file)
-  const response = await request(`${ANTHROPIC_BASE_URL}/files`, {
+  const response = await request(`${getApiBaseUrl()}/files`, {
     method: 'POST',
-    headers: anthropicHeaders(apiKey, true),
+    headers: authHeaders(apiKey),
     body: form,
     signal,
   })
   return (await response.json()) as FileObject
 }
 
-/** DELETE /anthropic/v1/files/{file_id} */
+/** DELETE /files/{file_id} */
 export const deleteFile = async (apiKey: string, fileId: string): Promise<void> => {
-  await request(`${ANTHROPIC_BASE_URL}/files/${encodeURIComponent(fileId)}`, {
+  await request(`${getApiBaseUrl()}/files/${encodeURIComponent(fileId)}`, {
     method: 'DELETE',
-    headers: anthropicHeaders(apiKey, true),
+    headers: authHeaders(apiKey),
   })
 }
 
-const hasFile = (body: CreateMessageRequest) =>
-  body.messages.some(
-    (message) =>
-      typeof message.content !== 'string' &&
-      message.content.some((block) => block.type === 'image' || block.type === 'document')
-  )
-
 /**
- * POST /anthropic/v1/messages（stream: true），逐个产出流式事件，收到 message_stop 时结束。
- * ping、保活注释与无法解析的内容不产出；中止请求时抛出 signal 的 AbortError。
+ * POST /chat/completions，续写时用 /beta/chat/completions，逐个产出流式 chunk。
+ * 地址取当前配置的端点，因此可以指向任何 OpenAI 兼容服务。
+ * 以 `data: [DONE]` 结束；保活注释、无法解析的内容不产出；中止请求时抛出 signal 的 AbortError。
  */
-export async function* streamMessage(
+export async function* streamChat(
   apiKey: string,
-  body: CreateMessageRequest,
-  signal: AbortSignal
-): AsyncGenerator<MessageStreamEvent> {
-  const response = await request(`${ANTHROPIC_BASE_URL}/messages`, {
+  body: ChatRequest,
+  signal: AbortSignal,
+  /** 末尾 assistant 带 prefix 时服务端只接受 beta 端点 */
+  beta = false
+): AsyncGenerator<ChatChunk> {
+  const base = getApiBaseUrl()
+  const response = await request(`${beta ? `${base}/beta` : base}/chat/completions`, {
     method: 'POST',
     headers: {
-      ...anthropicHeaders(apiKey, hasFile(body)),
+      ...authHeaders(apiKey),
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },
@@ -160,29 +144,34 @@ export async function* streamMessage(
   if (!response.body || !contentType.includes('text/event-stream')) {
     throw await readErrorResponse(response, 'protocol', '')
   }
-  for await (const { event: eventName, data } of readServerSentEvents(response.body, signal)) {
+  let finished = false
+  for await (const { data } of readServerSentEvents(response.body, signal)) {
+    // OpenAI 兼容流以 [DONE] 结尾；没有它说明本次生成被中断
+    if (data.trim() === '[DONE]') {
+      finished = true
+      return
+    }
     let payload: unknown
     try {
       payload = JSON.parse(data)
     } catch {
-      if (eventName !== 'error') {
-        continue
-      }
+      continue
     }
+    // 生成中途失败：错误帧带 usage，且没有 choices
     if (isErrorBody(payload)) {
       throw new ApiError('stream', payload.error.message)
     }
-    if (eventName === 'error') {
-      throw new ApiError('stream', data)
-    }
-    const event = readMessageEvent(payload)
-    if (!event) {
+    const chunk = readChatChunk(payload)
+    if (!chunk) {
       continue
     }
-    yield event
-    if (event.type === 'message_stop') {
-      return
+    yield chunk
+    if (chunk.choices.some((choice) => choice.finish_reason !== null)) {
+      finished = true
     }
+  }
+  if (finished) {
+    return
   }
   // 服务端没有提供错误内容时保持为空，不推测断流原因。
   throw new ApiError('interrupted', '')

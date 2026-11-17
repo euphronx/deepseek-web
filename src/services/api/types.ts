@@ -1,12 +1,241 @@
 /**
- * Messages API（Anthropic 兼容格式）协议类型，只取本应用用到的部分。
- * 文档：https://api-docs.deepseek.com/zh-cn/api/create-message
- * 声明 deepseek_web_search / deepseek_read_url 或设置 safety_check.level 为 high 时进入扩展模式。
+ * 线上协议：OpenAI 兼容的 Chat Completions 接口，外加 DeepSeek 的搜索、审核与标题扩展。
+ * 文档：https://api-docs.deepseek.com/api/create-chat-completion
+ *
+ * 文件分两部分：
+ * 1. 线上协议（请求、流式块、工具调用、文件对象）——只在这里声明一次；
+ * 2. 本地内容块（TextBlock / ThinkingBlock / ServerToolBlock 等）——界面时间线、
+ *    来源面板与归档读写都建立在它上面，与线上协议解耦，由 toolCalls.ts 转换。
  */
 
 export type ChatModel = 'deepseek-flash' | 'deepseek-v4-pro'
 
-// ---------- 响应：内容块 ----------
+/** 推理强度；不同端点的支持范围不同，不支持的会被忽略 */
+export type ReasoningEffort = 'low' | 'high' | 'max'
+
+// ======================================================================
+// 线上协议
+// ======================================================================
+
+// ---------- 请求 ----------
+
+/** 文本片段 */
+export type ChatPartText = { type: 'text'; text: string }
+
+/** 图片片段：http(s) 链接或 data URL；经 Files API 上传的图片改用 file 片段 */
+export type ChatPartImage = {
+  type: 'image_url'
+  image_url: { url: string; detail?: 'low' | 'high' | 'original' | 'auto' }
+}
+
+/** 文件片段：引用经 Files API 上传的文件，图片与文档都用它 */
+export type ChatPartFile = { type: 'file'; file_id: string; filename?: string }
+
+export type ChatPart = ChatPartText | ChatPartImage | ChatPartFile
+
+/** 一次工具调用；流式进度事件里的 call_completed 不带 signature */
+export type ChatToolCall = {
+  index: number
+  id: string
+  /** 声明该能力的工具 */
+  type: ChatToolName
+  kind: ChatToolKind
+  action: ChatToolAction
+  /** call_started 事件不带状态，按 in_progress 处理 */
+  status: 'in_progress' | 'completed' | 'failed'
+  /** 搜索召回的结果 */
+  sources?: ChatSource[]
+  /** 打开或阅读过的页面 */
+  page?: ChatPage
+  /** 仅成功阅读的链接返回，回传时原样带上 */
+  signature?: string
+  error?: ChatToolCallError
+}
+
+/** 回传历史时只保留必要字段 */
+export type ChatToolCallParam = {
+  index: number
+  id: string
+  type: ChatToolName
+  kind: ChatToolKind
+  action: ChatToolAction
+  status: 'completed' | 'failed'
+  page?: ChatPage
+  signature?: string
+}
+
+/** 一步（一段思考）及其发出的调用 */
+export type ChatToolStep = {
+  index: number
+  reasoning_content?: string
+  calls: ChatToolCall[]
+}
+
+export type ChatServerToolCallsParam = {
+  index: number
+  reasoning_content?: string
+  calls: ChatToolCallParam[]
+}
+
+export type ChatMessageParam =
+  /** 系统提示词 */
+  | { role: 'system'; content: string }
+  /** DeepSeek 扩展角色，必须紧邻它所属的 user 消息之前 */
+  | { role: 'latest_reminder'; content: string }
+  | { role: 'user'; content: string | ChatPart[] }
+  | {
+      role: 'assistant'
+      content: string
+      /** 续写时置 true，必须走 /beta 端点 */
+      prefix?: boolean
+      /** 续写的思考前缀，与 prefix 一起使用 */
+      reasoning_content?: string
+      server_tool_calls?: ChatServerToolCallsParam[]
+    }
+
+/** 联网搜索（含边想边搜与以图搜图） */
+export type ChatWebSearchTool = { type: 'deepseek_web_search' }
+
+/** 阅读本轮用户消息中的链接，与搜索工具独立声明 */
+export type ChatReadUrlTool = { type: 'deepseek_read_url' }
+
+export type ChatTool = ChatWebSearchTool | ChatReadUrlTool
+
+export type ChatRequest = {
+  /** 模型标识；接第三方兼容端点时可以是任意字符串 */
+  model: string
+  messages: ChatMessageParam[]
+  thinking?: { type: 'enabled' | 'disabled' }
+  /** 推理强度；端点不支持时会被服务端忽略 */
+  reasoning_effort?: ReasoningEffort
+  tools?: ChatTool[]
+  tool_choice?: 'none' | 'auto'
+  safety_check?: { level: 'low' | 'high' }
+  title?: { enabled: boolean }
+  max_tokens?: number
+  stream?: boolean
+}
+
+// ---------- 响应：工具调用 ----------
+
+/** 识别调用所属联网能力，区分文字搜索、图搜及边想边搜 */
+export type ChatToolKind =
+  | 'search'
+  | 'deep_search'
+  | 'read_link'
+  | 'image_search'
+  | 'deep_image_search'
+
+/** 声明该能力的工具名 */
+export type ChatToolName = 'deepseek_web_search' | 'deepseek_read_url'
+
+/** 四种动作，参数结构由 type 决定 */
+export type ChatToolAction =
+  | { type: 'search'; queries: string[] }
+  | { type: 'open_page'; url: string }
+  | { type: 'find_in_page'; url: string; pattern: string }
+  | { type: 'read_link'; url: string }
+
+/** 搜索结果的展示字段；图搜结果另有 image_url */
+export type ChatSource = {
+  type: 'url'
+  url: string
+  title: string
+  snippet?: string | null
+  site_name?: string | null
+  site_icon?: string | null
+  published_at?: string | null
+  /** 图搜召回的原站图片地址，可能缺省且不保证可访问 */
+  image_url?: string | null
+}
+
+/** 打开或阅读过的页面 */
+export type ChatPage = {
+  url: string
+  title: string | null
+  published_at: string | null
+}
+
+export type ChatToolCallError = { code: string }
+
+/** 流式进度事件，位于 choice 上、与 delta 平级，每个 chunk 最多一个 */
+export type ChatServerToolEvent =
+  | { type: 'step_reasoning_done'; step: number }
+  | { type: 'call_started'; step: number; call: ChatToolCall }
+  | { type: 'call_completed'; step: number; call: ChatToolCall }
+
+// ---------- 响应：引用 ----------
+
+/** 正文引用的位置；start_index / end_index 按 Unicode 码点计 */
+export type ChatUrlCitation = {
+  type: 'url_citation'
+  url_citation: {
+    url: string
+    /** 查不到标题时为 URL 本身 */
+    title: string
+    start_index: number
+    end_index: number
+  }
+}
+
+export type ChatAnnotation = ChatUrlCitation
+
+// ---------- 响应：流式块 ----------
+
+export type ChatFinishReason =
+  | 'stop'
+  | 'length'
+  | 'content_filter'
+  | 'tool_calls'
+  | 'insufficient_system_resource'
+  | 'aborted'
+
+export type ChatDelta = {
+  role?: 'assistant'
+  content?: string | null
+  reasoning_content?: string | null
+  /** 整轮结束时一次性下发，流式期间不出现 */
+  annotations?: ChatAnnotation[]
+  /** 整轮结束时一次性下发 */
+  server_tool_calls?: ChatToolStep[]
+  /** 开启 title 时在最后一个 chunk 出现 */
+  title?: string
+  /** 图片未通过审核时点名被拦截的图片 */
+  refusal?: string
+}
+
+export type ChatChoice = {
+  index: number
+  delta: ChatDelta
+  server_tool_event?: ChatServerToolEvent
+  finish_reason: ChatFinishReason | null
+}
+
+export type ChatChunk = {
+  id: string
+  object: 'chat.completion.chunk'
+  created: number
+  model: string
+  choices: ChatChoice[]
+  usage?: ChatUsage | null
+}
+
+/** 用量：服务端在最后一个 chunk 给出整轮合计 */
+export type ChatUsage = {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  prompt_cache_hit_tokens: number
+  prompt_cache_miss_tokens: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  completion_tokens_details?: { reasoning_tokens?: number; safety_tokens?: number }
+  /** 计费的搜索、抓取与图搜次数 */
+  server_tool_use?: { tool_search?: number; tool_fetch?: number; tool_image_search?: number }
+}
+
+// ---------- 本地内容块 ----------
+// 回复按接收顺序保存为这些块：界面时间线、来源面板与归档都从这里推导。
+// 它们不是线上协议，回传请求时由 reply.ts 重新组装成 ChatMessageParam。
 
 /** 正文引用：服务端把模型的引用标记还原为来源，挂在对应文本块上 */
 export type TextCitation = {
@@ -23,7 +252,7 @@ export type TextCitation = {
 /** 文本块：挂过引用的块之后，后续正文另起新块；同一块内引用按 url 去重 */
 export type TextBlock = { type: 'text'; text: string; citations?: TextCitation[] }
 
-/** 思考块：签名在块结束前经 signature_delta 下发，值为本次响应的消息 id */
+/** 思考块：签名在块结束前随 chunk 下发，值为本次响应的消息 id */
 export type ThinkingBlock = { type: 'thinking'; thinking: string; signature: string }
 
 /** 服务端识别调用所属联网能力用的 kind，区分文字搜索、图搜及边想边搜。 */
@@ -42,7 +271,7 @@ export type ServerToolInput =
   | { action: 'find_in_page'; url: string; pattern: string }
   | { action: 'read_link'; url: string }
 
-/** 服务端工具调用块：原子下发，content_block_start 即携带完整 input */
+/** 服务端工具调用块：原子下发，末块一次给出完整 input */
 export type ServerToolUseBlock = {
   type: 'server_tool_use'
   /** srvtoolu_{s|ds|rl|is|dis}_{序号}_{32 位 hex} */
@@ -118,138 +347,48 @@ export type ServerToolBlock =
   | WebSearchToolResultBlock
   | WebFetchToolResultBlock
 
-/** 用于识别客户端工具调用的内容块类型 */
-export type ToolUseBlock = { type: 'tool_use'; id: string; name: string; input: unknown }
-
-// ---------- 请求 ----------
-
-export type TextBlockParam = { type: 'text'; text: string }
-
-/**
- * 文件块：引用经 Files API 上传的文件，图片用 image、其余用 document；
- * 图片请求需带 anthropic-beta: files-api-2025-04-14；扩展模式不支持 document，返回 400。
- */
-export type FileBlockParam = {
-  type: 'image' | 'document'
-  source: { type: 'file'; file_id: string }
-}
-
-/** 接口接受的调用块；历史只回传 kind 为 read_link 的调用 */
-export type ServerToolUseBlockParam = Pick<
-  ServerToolUseBlock,
-  'type' | 'id' | 'name' | 'input' | 'kind'
->
-
-/** 接口接受的搜索结果块；历史搜索结果不回传 */
-export type WebSearchToolResultBlockParam = WebSearchToolResultBlock
-
-/** 只回传 read_link 结果；成功时原样保留 signature，供服务端解密恢复网页上下文 */
-export type WebFetchToolResultBlockParam = WebFetchToolResultBlock
-
-export type AssistantBlockParam =
-  | TextBlockParam
-  | ThinkingBlock
-  | ServerToolUseBlockParam
-  | WebSearchToolResultBlockParam
-  | WebFetchToolResultBlockParam
-
-/** 末尾 assistant 自动触发继续生成，无需 prefix 字段 */
-export type MessageParam =
-  /** Chat Engine 扩展角色，位于对应 user 前；需服务端支持 latest_reminder。 */
-  | { role: 'latest_reminder'; content: string }
-  | { role: 'user'; content: string | (FileBlockParam | TextBlockParam)[] }
-  | { role: 'assistant'; content: AssistantBlockParam[] }
-
-/** 开启联网搜索与边想边搜 */
-export type DeepseekWebSearchTool = {
-  type: 'deepseek_web_search'
-  name: 'deepseek_web_search'
-}
-
-/** 阅读本轮用户消息中的链接，与搜索工具独立声明 */
-export type DeepseekReadUrlTool = {
-  type: 'deepseek_read_url'
-  name: 'deepseek_read_url'
-}
-
-export type CreateMessageRequest = {
-  model: ChatModel
-  system: string
-  messages: MessageParam[]
-  thinking: { type: 'enabled' | 'disabled' }
-  tools: (DeepseekWebSearchTool | DeepseekReadUrlTool)[]
-  safety_check: { level: 'high' }
-  title?: { enabled: boolean }
-}
-
-// ---------- 响应：流式事件 ----------
+// ---------- 本地：结束原因、用量、文件 ----------
 
 export type StopReason = 'end_turn' | 'max_tokens' | 'tool_use' | 'refusal'
 
 export type StopDetails = { type: 'refusal'; category: null; explanation: null }
 
+/** 由 ChatUsage 映射而来；字段名保持不变以兼容归档与用量展示 */
 export type MessageUsage = {
   /** 未命中缓存的输入 Token */
   input_tokens: number
+  /** 服务端不返回缓存创建量，恒为 0 */
   cache_creation_input_tokens: number
+  /** 命中上下文缓存的输入 Token */
   cache_read_input_tokens: number
-  /** message_start 中为 0，message_delta 中为全轮累计值 */
+  /** 整轮累计的输出 Token */
   output_tokens: number
-  /** 仅当 message_delta 中有对外输出的搜索结果块时出现 */
+  /** 计费的搜索与抓取次数 */
   server_tool_use?: { web_search_requests: number; tool_search: number }
 }
 
-/** content_block_start 携带的初始内容块；工具块已是完整内容 */
-export type OutputBlockStart = TextBlock | ThinkingBlock | ServerToolBlock | ToolUseBlock
-
-export type ContentBlockDelta =
-  | { type: 'text_delta'; text: string }
-  | { type: 'thinking_delta'; thinking: string }
-  | { type: 'signature_delta'; signature: string }
-  | { type: 'citations_delta'; citation: TextCitation }
-  | { type: 'input_json_delta'; partial_json: string }
-
-/** 流式事件：SSE 的 event 名与 JSON 的 type 相同，以 message_stop 结束，不发送 [DONE] */
-export type MessageStreamEvent =
-  | {
-      type: 'message_start'
-      /** id 为不带 msg_ 前缀的 UUID，等于响应头 x-ds-request-id */
-      message: { id: string; model: string; usage?: MessageUsage }
-    }
-  | { type: 'content_block_start'; index: number; content_block: OutputBlockStart }
-  | { type: 'content_block_delta'; index: number; delta: ContentBlockDelta }
-  | { type: 'content_block_stop'; index: number }
-  | {
-      type: 'message_delta'
-      /** title 仅在开启标题且生成成功时出现；stop_details 仅在 refusal 时出现 */
-      delta: {
-        stop_reason: StopReason
-        stop_sequence: null
-        stop_details?: StopDetails
-        title?: string
-      }
-      usage?: MessageUsage
-    }
-  | { type: 'message_stop' }
-  | { type: 'ping' }
+/** 本地回复里的内容块，界面与归档共用 */
+export type OutputBlockStart = TextBlock | ThinkingBlock | ServerToolBlock
 
 /**
- * POST /anthropic/v1/files 的 purpose：PDF 与 Word、PPT 需要服务端做版面解析；
- * 纯文本、代码、表格与电子书不需要解析，用 user_data。
+ * POST /files 的 purpose：PDF 与 Word、PPT 需要服务端做版面解析；
+ * 图片与纯文本、代码、表格、电子书用 user_data。OpenAI 兼容端该字段必填。
  */
 export type FilePurpose = 'rich_layout_recognition' | 'user_data'
 
-/** POST /anthropic/v1/files 的响应 */
+/** POST /files 的响应（OpenAI 兼容形态） */
 export type FileObject = {
   id: string
-  type: 'file'
-  size_bytes: number
-  created_at: string
+  object: 'file'
+  /** 文件字节数 */
+  bytes: number
+  /** Unix 秒 */
+  created_at: number
   filename: string
-  mime_type: string
+  purpose: FilePurpose
 }
 
-/** 非 2xx 响应体；流中出现只含 error 的无名 data 帧时同样按此解析 */
+/** 非 2xx 响应体；流中出现只含 error 的帧时同样按此解析 */
 export type ApiErrorBody = {
   error: {
     message: string

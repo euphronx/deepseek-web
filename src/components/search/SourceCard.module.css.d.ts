@@ -8,6 +8,10 @@ declare const styles: {
   readonly "date": string;
   readonly "title": string;
   readonly "snippet": string;
+  readonly "thumbnail": string;
+  readonly "thumbnailImage": string;
+  readonly "thumbnailSkeleton": string;
+  readonly "thumbnailFallback": string;
 };
 export = styles;
 
